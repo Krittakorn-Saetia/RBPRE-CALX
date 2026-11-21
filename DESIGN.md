@@ -78,6 +78,33 @@ digest h_A = H(A), and the request-context digest h_ctx (Eq. 51). Every other
 H(·) is SHA-256 with canonical encoding. Identifiers and attributes enter the
 field as the first 31 bytes of their SHA-256 digest.
 
+## Authorization circuits (zk/circuit.go)
+
+Two Groth16 circuits over BLS12-381, both with m policy slots and m credential
+attribute slots:
+
+- **HolderCircuit**, the revised R_auth (Eq. 53–55). It checks the issuer's VC
+  signature over MiMC(Attr_D ∥ DID_D ∥ cid_D ∥ t_VC), the holder's signature
+  σ_D over h_ctx under pk_D, H(A) = h_A, policy satisfaction, t_start ≤ t_G ≤
+  t_end, t_G ≤ t_VC, and h_ctx = MiMC(Req ∥ h_A ∥ t_G ∥ n_G ∥ cb_D).
+- **OriginalCircuit**, the relation of the first submission (v1 Eq. 49–51):
+  the VC signature over MiMC(Attr_D ∥ DID_D ∥ t_VC), the same committed policy
+  check, t_now ≤ t_VC, and h_ctx = MiMC(DID_D ∥ PID* ∥ Purpose ∥ Scope ∥ e).
+  It has no holder signature and no gateway challenge.
+
+The bounded policy A has m required-attribute slots (0 = empty slot), one
+permitted purpose, one permitted scope and a validity window. Each required
+attribute r is enforced as r · Π_j (r − Attr_j) = 0. Timestamps are compared
+as b − a ∈ [0, 2^64). The proof is the three compressed group elements
+(A, B, C) = 48 + 96 + 48 = **192 bytes**.
+
+Challenge freshness, single use of n_G (Eq. 61) and the revocation and
+session checks stay outside the circuit, as the paper states. n_G is consumed
+atomically with Redis GETDEL, so a replay finds no nonce.
+
+Setup is gnark's single-party `groth16.Setup`, whose toxic waste stays in
+memory and is discarded. A deployment would use gnark's MPC setup instead.
+
 ## Process layout
 
 - One Python process runs the protocol roles. Every external service is real
@@ -95,7 +122,12 @@ field as the first 31 bytes of their SHA-256 digest.
 | Python | 3.10.12 (WSL Ubuntu 22.04) |
 | Charm-Crypto | 0.63 |
 | Go | 1.22.5 |
+| gnark / gnark-crypto | v0.11.0 / v0.14.0 |
 | Hyperledger Fabric | 2.5.9 |
+| Neo4j | 5.26.33 Community (Docker `neo4j:5.26-community`) |
+| Redis | 7.4.12 (Docker `redis:7.4-alpine`) |
+| MinIO | RELEASE.2025-10-15T17-29-55Z, built from the official source by `infra/build_minio.sh` (MinIO no longer publishes official images) |
+| Docker Engine | 29.5.3 |
 
 The paper's setup section must list the versions and the machine used for the
 final measurement run.

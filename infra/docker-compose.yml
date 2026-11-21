@@ -1,0 +1,42 @@
+# Off-chain services of RBPRE-CALX. Hyperledger Fabric runs separately
+# (fabric-samples test-network). Every port is bound to 127.0.0.1 only.
+# Credentials come from infra/.env, which infra/services.sh generates.
+name: rbpre-calx
+
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?run infra/services.sh up}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 1g
+      NEO4J_server_memory_pagecache_size: 512m
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - neo4j-data:/data
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "${REDIS_PASSWORD:?run infra/services.sh up}"]
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  minio:
+    # Built locally from the official source by infra/build_minio.sh
+    # (MinIO no longer publishes official images).
+    image: rbpre-minio:RELEASE.2025-10-15T17-29-55Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: rbpre
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:?run infra/services.sh up}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio-data:/data
+
+volumes:
+  neo4j-data:
+  minio-data:

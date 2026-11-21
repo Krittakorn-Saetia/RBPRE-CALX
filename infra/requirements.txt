@@ -1,0 +1,7 @@
+# Python dependencies of RBPRE-CALX (installed by infra/setup_venv.sh).
+# Charm-Crypto 0.63 is installed separately (it needs libgmp, libpbc, libssl).
+pyparsing>=3.0,<4        # Charm's policy parser
+cryptography>=42,<47     # AES-256-GCM, Ed25519
+neo4j>=5.20,<6           # retrieval graph client
+redis>=5.0,<6            # authorization / re-key cache client
+minio>=7.2,<8            # encrypted object storage client
