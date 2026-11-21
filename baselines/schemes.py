@@ -79,6 +79,11 @@ class Wang25:
         pay = [json.dumps([self.p.T_H(os.urandom(16)).hex()]) for _ in range(n_events)]
         per_event_invoke(self.ledger, "AnchorShares", pay, concurrency)
 
+    def revoke(self) -> None:
+        """Blacklisting at the trusted authority: T_H."""
+        self.blacklist = getattr(self, "blacklist", set())
+        self.blacklist.add(self.p.T_H(self.tid, os.urandom(8)))
+
 
 class Yan27:
     name = "[27]"
@@ -125,6 +130,18 @@ class Yan27:
             c1, c2, _ = self.comp[i % POOL]
             p.T_P(c1, c2)
             p.T_H(e.rid.encode())
+
+    def policy_update(self, records) -> None:
+        """Delegation / policy update (Table IV): every affected ciphertext is
+        re-encrypted under the new policy, T_P + (m+1) T_E + m T_M per record."""
+        p = self.p
+        for i, _ in enumerate(records):
+            c1, c2, _ = self.comp[i % POOL]
+            p.T_P(c1, c2)
+            x = c1
+            for a, r in self.attr:
+                x = p.T_M(x, p.T_E(a, r))
+            p.T_E(c2, self.attr[0][1])
 
     def anchor(self, n_events: int, concurrency: int) -> None:
         """Distributed update with consensus per sharing event."""
@@ -184,6 +201,10 @@ class Luo31:
     def anchor(self, n_events: int, concurrency: int) -> None:
         pay = [json.dumps([self.p.T_H(os.urandom(16)).hex()]) for _ in range(n_events)]
         per_event_invoke(self.ledger, "AnchorShares", pay, concurrency)
+
+    def revoke(self) -> None:
+        """Domain/identity revocation: one state update with consensus (T_B^upd + T_con)."""
+        self.ledger.anchor_shares([self.p.T_H(b"revoke", os.urandom(16)).hex()])
 
 
 class PlainPRE:

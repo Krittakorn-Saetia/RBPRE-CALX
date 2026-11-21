@@ -11,7 +11,33 @@ export RBPRE_RUN=final-<machine>
 PY=~/.venvs/rbpre-calx/bin/python
 $PY -m experiments.micro                  # primitive and building-block costs
 $PY -m experiments.exp1_authz             # Experiment 1 (a)(b)(c)
+$PY -m experiments.exp234_retrieval       # Experiments 2, 3, 4
+$PY -m experiments.exp5_trace             # Experiment 5
+$PY -m experiments.exp6_hospitals         # Experiment 6
+$PY -m experiments.exp7_ablation          # Experiment 7
+$PY -m experiments.exp_revocation         # revocation and consent-update cost
+$PY -m experiments.plot                   # figures + summary tables (needs matplotlib)
 ```
+
+Every driver has `--help`. A series whose first run at a point takes longer
+than `--heavy-s` (default 60 s) is capped at `--runs-heavy` runs for that
+point (default 5). The CSV keeps the actual run count of every mean.
+
+## Workload (`experiments/workload.py`)
+
+- **Records.** One requester at the first hospital. Each target patient has N
+  records spread uniformly over H hospitals, with timestamps over two years.
+- **Delegation.** Every hospital, including the requester's own, delegates to
+  the requester's domain.
+- **Authorized fraction.** A record is authorized with probability
+  `--ratio`: its class is drawn from the classes the cardiology scope and
+  treatment purpose permit. Otherwise its class is one the policy excludes
+  (psych, genetic, admin).
+- **Ground truth.** Every run checks that the T_auth RBPRE-CALX computes equals
+  the generator's set of authorized records.
+- **Background records.** Records of other patients (`--background` × N) go
+  into the retrieval graph and the scan index only.
+- **Payloads.** 256 random bytes per reading.
 
 ## Compared schemes
 
@@ -81,3 +107,81 @@ This driver measures:
     credential, a revoked credential, and two concurrent submissions of one
     proof.
   - It records the outcome and the time to rejection.
+
+## Experiments 2–4 (`experiments.exp234_retrieval`)
+
+These run on one patient history that grows through N ∈ {1k, 5k, 10k, 20k,
+30k, 40k, 50k} (H = 5, ratio 10%). At each N, a first retrieval creates the
+new linkage entries and is reported as `first`. Every run then uses a new
+session.
+
+- **Exp 2: retrieval latency.**
+  - **RBPRE-CALX:** Phase 4 (admission, graph discovery, filtering, linkage,
+    record and linkage verification, release).
+  - **Baselines:** repository scan plus their per-record validation, on all
+    of the patient's records and filter-equalized.
+- **Exp 3: transformation.**
+  - **RBPRE-CALX:** Phase 5 on T_auth, with a re-key cache miss (first use in
+    the session) and a hit (second use).
+  - **Baselines:** transformation of every patient record, and of T_auth only.
+- **Exp 4: verification.**
+  - **RBPRE-CALX:** the verification steps of Phase 4 (fetch, record
+    commitments, linkage state, Merkle proofs).
+  - **[27], [31] and PRE:** their per-record verification over the same |T_f|
+    records.
+
+## Experiment 5 (`experiments.exp5_trace`)
+
+For E ∈ {10, 50, 100, 250, 500, 1000} audit events, the driver measures the
+time until all evidence is committed on Fabric:
+
+- **RBPRE-CALX and [25]:** batched commitments.
+- **[27] and [31]:** one transaction per event, from `--concurrency` (10)
+  parallel clients.
+
+The per-event schemes need one Fabric transaction per event, so larger E
+values take very long to run.
+
+## Experiment 6 (`experiments.exp6_hospitals`)
+
+N = 5,000 records over H ∈ {1, 2, 5, 10, 15, 20} hospitals.
+
+- **RBPRE-CALX:** discovery plus selective transformation in a new session.
+- **Baselines:** one authentication per hospital, scan, transformation and
+  verification, on all records and filter-equalized.
+
+## Experiment 7 (`experiments.exp7_ablation`)
+
+N = 10,000 and |T_auth|/N ∈ {1, 5, 10, 25, 50, 75, 100}%, with five variants:
+
+- the full framework (repeated request in a valid session)
+- (i) a new proof and no re-key cache
+- (ii) no early filter
+- (iii) every candidate transformed
+- (iv) (ii) and (iii) together
+
+`e7_stages.csv` holds per-stage times for stacked bars. `plot` writes
+`e7_welch.csv`, Welch's t-test between (iii) and (iv) at each ratio.
+
+## Revocation and consent updates (`experiments.exp_revocation`)
+
+For N ∈ {1k, 5k, 10k} records and S ∈ {1, 10, 50} live sessions with cached
+re-key states, every run measures four events:
+
+- a policy update (new epoch, pseudonym and consent; invalidation), then the
+  hospitals' re-delegation and the first retrieval afterwards, against a
+  steady-state retrieval
+- consent withdrawal
+- delegation revocation
+- credential revocation
+
+Each Fabric write waits for commit, so event times include finalization.
+
+- **No re-pseudonymization.** The driver asserts that every record, including
+  records from earlier epochs, is still retrieved after the epoch advance. No
+  stored record is re-pseudonymized.
+- **Compared schemes:**
+  - [27] re-encrypts every affected ciphertext: T_P + (m+1) T_E + m T_M per
+    record.
+  - [31] runs one state update with consensus.
+  - [25] blacklists with T_H.

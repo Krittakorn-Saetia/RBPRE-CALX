@@ -10,14 +10,11 @@ retrieval graph, authenticated record-level filtering, retrieval-bound
 attribute-based proxy re-encryption (RB-ABPRE) over the CP-ABPRE of Ibraimi
 et al., and blockchain-anchored record and linkage commitments.
 
-**Status: under construction.** Done so far:
-- the crypto core
-- the Groth16 authorization circuits
-- the Fabric chaincode
-- the Neo4j, MinIO and Redis clients
-- Phases 1–5 end to end, tested on the Fabric test-network
+**Status:** the prototype, the compared schemes and all experiment drivers
+are implemented and smoke-tested. The final measurement runs are pending.
 
-Still to come: the compared schemes and the experiment drivers.
+- [EXPERIMENTS.md](EXPERIMENTS.md): every experiment, how the compared
+  schemes are modeled, and how to run them.
 
 - [DESIGN.md](DESIGN.md): how each part of the construction is implemented,
   and every choice the paper leaves open.
@@ -37,6 +34,8 @@ Still to come: the compared schemes and the experiment drivers.
 | `rbpre/protocol.py` | Phases 1–5, one method per paper step, with per-step timers |
 | `chaincode/` | Go chaincode (DID, credential, consent/CMC, delegation, epoch, record, linkage, anchors) and its ccaas deploy script |
 | `smoke_protocol.py` | one end-to-end run with a per-step latency breakdown |
+| `baselines/` | compared schemes [25], [27], [31] and a conventional CP-ABPRE pipeline |
+| `experiments/` | workload generator, experiment drivers, microbenchmarks, plotting |
 | `zk/` | Go helper: gnark Groth16 on BLS12-381 (holder-bound and original R_auth), Jubjub EdDSA, MiMC |
 | `infra/` | Python environment, Docker Compose services, MinIO build |
 | `tests/` | unit and integration tests |

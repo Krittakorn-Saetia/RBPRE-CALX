@@ -545,6 +545,7 @@ class RBPRESystem:
                 c["auth"] = self.authorized(doc, op["meta"], s, pol)                    # Eq. 74
                 checked.append(c)
             t_f = [c for c in checked if c["auth"]] if early_filter else checked       # Eq. 75
+        self.last_candidates = checked  # for the ablation variants that skip selection
         # ---- Step 4: linkage identifiers (Eq. 76-77)
         with t.step("p4.linkage_prepare"):
             new_flags = []
@@ -629,6 +630,11 @@ class RBPRESystem:
         every candidate key capsule (all_candidates)."""
         doc, p = s.doctor, s.patient
         targets = t_auth if selective else (all_candidates or t_auth)
+        missing = [c for c in targets if "ct" not in c]
+        if missing:  # candidates that discovery did not fetch (non-selective variant)
+            with t.step("p5.fetch_candidates"):
+                for c, blob in zip(missing, self.store.get_many([c["uri"] for c in missing])):
+                    c["ct"] = blob
         self.valid_state(s, t, "p5.kms_state")                                         # Eq. 82
         h_chi = s.chi.digest()
         p_b = f"{rb.id_attr(doc.did)} AND {doc.attrs[0]}"
@@ -750,7 +756,9 @@ class RBPRESystem:
         with t.step("rev.chain_cred"):
             self.ledger.set_status("cred", doc.cid.hex(), "revoked")
         with t.step("rev.cache_invalidate"):
-            return self.cache.invalidate(doc.did)
+            removed = self.cache.invalidate(doc.did)
+        t.add("rev.entries_invalidated", 0.0, removed)
+        return removed
 
     def revoke_delegation(self, p: Patient, source: str, target: str, t: Timer = _NULL) -> None:
         d = self.delegations[(source, target, p.pid_star())]
