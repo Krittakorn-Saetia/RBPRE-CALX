@@ -133,10 +133,17 @@ Points that the paper's text leaves open, and how the prototype fixes them:
    (Phase 4 Step 4). Existing entries are reused under the same context.
    ComAuth (Eq. 65) and ComShare (Eq. 90) are queued and submitted off the
    retrieval path (`flush_anchors`), and that cost is measured separately.
-6. **Chain state is read at every check.** ValidState (Eq. 70, 82, 86) and the
-   record and linkage verifications (Eq. 79–80, 88) each query the chaincode
-   rather than a local snapshot. This is the strictest reading of "latest
-   synchronized finalized state", and its cost appears in the measurements.
+6. **Synchronized finalized state.** Every chaincode write emits one `state`
+   event carrying the entries it changed. The Fabric Gateway helper `fabgw`
+   follows these events from block 0 and keeps a mirror of the finalized state.
+   ValidState (Eq. 70, 82, 86) and the record and linkage verifications
+   (Eq. 79–80, 88) read that mirror. A write returns only after it is
+   committed *and* applied to the mirror, so a revocation is effective at the
+   gateway as soon as it is finalized. The time from commit to mirror
+   application is recorded (`sync_ms`). `state_mode="query"` instead asks the
+   chaincode at every check, for comparison.
+   Every scheme uses the same Gateway client for its own chain operations, so
+   the compared schemes' T_B^qry is also a gateway query, not a CLI call.
 7. **The edge TEE is not emulated.** Device AEAD, verification and aggregation
    (Eq. 35–39) run as ordinary code on the measurement machine.
 8. **Fabric deployment.** The test-network has two organizations with one peer
@@ -163,6 +170,7 @@ Points that the paper's text leaves open, and how the prototype fixes them:
 | Go | 1.22.5 |
 | gnark / gnark-crypto | v0.11.0 / v0.14.0 |
 | Hyperledger Fabric | 2.5.9 |
+| Fabric Gateway client | `github.com/hyperledger/fabric-gateway` v1.5.1 (in `fabgw/`) |
 | Neo4j | 5.26.33 Community (Docker `neo4j:5.26-community`) |
 | Redis | 7.4.12 (Docker `redis:7.4-alpine`) |
 | MinIO | RELEASE.2025-10-15T17-29-55Z, built from the official source by `infra/build_minio.sh` (MinIO no longer publishes official images) |

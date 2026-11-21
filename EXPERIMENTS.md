@@ -19,9 +19,30 @@ $PY -m experiments.exp_revocation         # revocation and consent-update cost
 $PY -m experiments.plot                   # figures + summary tables (needs matplotlib)
 ```
 
-Every driver has `--help`. A series whose first run at a point takes longer
-than `--heavy-s` (default 60 s) is capped at `--runs-heavy` runs for that
-point (default 5). The CSV keeps the actual run count of every mean.
+Every driver has `--help`. `experiments/run_all.sh` runs them in order and is
+resumable. `PROFILE=full` runs every experiment with the defaults. `PROFILE=quick`
+runs the set the revision needs, with fewer points and runs:
+
+- micro
+- Exp 1 with 10 runs
+- Exps 2–4 at 1k/5k/10k/25k/50k records with 10 runs
+- revocation at 1k/10k records with 5 runs
+- Exp 7 with 10 runs
+
+**Measurement hygiene.**
+- **Warm-up.** Each series starts with one warm-up run that is not recorded.
+  A series is "heavy" when that first run already takes longer than
+  `--heavy-s` (default 60 s). It then counts as the first measured run, and
+  the series stops at `--runs-heavy` runs; the CSV keeps the actual run count
+  of every mean.
+- **No collector pauses.** Every timed run is measured with Python's cyclic
+  garbage collector paused (`harness.quiet`).
+- **Fixed workload.** The workload uses a fixed random seed.
+
+**Chain client.** All schemes use the same Fabric Gateway client (`fabgw`,
+`RBPRE_CHAIN=gateway`, the default). RBPRE-CALX's validity checks read the
+gateway's synchronized mirror of the finalized state. `RBPRE_CHAIN=cli`
+switches every scheme to the peer CLI.
 
 ## Workload (`experiments/workload.py`)
 
@@ -92,11 +113,12 @@ This driver measures:
   - **RBPRE-CALX Fresh** runs the full Phase 3 (challenge, holder signature,
     proof, consent attestation, chain state, verification, nonce consumption,
     AuthTok) per request.
-  - **RBPRE-CALX Reuse** runs Phase 3 once per session of `--session-size`
-    requests. Every other request in the session runs ValidState (Eq. 70):
-    the holder-session binding, the chain state (credential, consent,
-    delegation, epoch) and the AuthTok signature. Freshness is not reused:
-    every new session needs a fresh challenge and proof.
+  - **RBPRE-CALX Reuse** runs Phase 3 once per session, for each value of
+    `--session-sizes` (10, 50, and 0 = one session for all k requests). Every
+    other request in the session runs ValidState (Eq. 70): the holder-session
+    binding, the synchronized chain state (credential, consent, delegation,
+    epoch) and the AuthTok signature. Freshness is not reused: every new
+    session needs a fresh challenge and proof.
   - The baselines run their authentication k times.
   - Requests are served one after another, and the result is their total
     latency.
@@ -116,8 +138,11 @@ new linkage entries and is reported as `first`. Every run then uses a new
 session.
 
 - **Exp 2: retrieval latency.**
-  - **RBPRE-CALX:** Phase 4 (admission, graph discovery, filtering, linkage,
-    record and linkage verification, release).
+  - **RBPRE-CALX:** T_ret of Eq. 158, which covers admission,
+    historical-pseudonym resolution and graph discovery, metadata-opening
+    verification and record-level filtering. The verification part of Phase
+    4 (Eq. 159) is Experiment 4. The whole of Phase 4 is also kept, as variant
+    `with verification`.
   - **Baselines:** repository scan plus their per-record validation, on all
     of the patient's records and filter-equalized.
 - **Exp 3: transformation.**

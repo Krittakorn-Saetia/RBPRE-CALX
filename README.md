@@ -30,7 +30,8 @@ are implemented and smoke-tested. The final measurement runs are pending.
 | `rbpre/aead.py`, `rbpre/sig.py`, `rbpre/merkle.py` | AES-256-GCM, Ed25519, patient Merkle tree |
 | `rbpre/zk.py` | client for the `zk/rbzk` helper |
 | `rbpre/graph.py`, `rbpre/storage.py`, `rbpre/cache.py` | Neo4j retrieval graph, MinIO EHR store, Redis nonces/sessions/re-key cache |
-| `rbpre/chain.py` | Fabric client (peer CLI, submit to commit) and an in-memory mirror for offline tests |
+| `rbpre/chain.py` | Fabric clients: Gateway (default, with the synchronized state mirror) and peer CLI; an in-memory ledger for offline tests |
+| `fabgw/` | Go helper: Fabric Gateway client that keeps a mirror of the finalized state from chaincode events |
 | `rbpre/protocol.py` | Phases 1–5, one method per paper step, with per-step timers |
 | `chaincode/` | Go chaincode (DID, credential, consent/CMC, delegation, epoch, record, linkage, anchors) and its ccaas deploy script |
 | `smoke_protocol.py` | one end-to-end run with a per-step latency breakdown |
@@ -45,6 +46,7 @@ are implemented and smoke-tested. The final measurement runs are pending.
 ```bash
 infra/setup_venv.sh                       # Python venv in ~/.venvs/rbpre-calx (Charm-Crypto 0.63)
 (cd zk && go build -o rbzk .)             # Go 1.22+
+(cd fabgw && go build -o fabgw .)         # Fabric Gateway client + state mirror
 infra/build_minio.sh                      # MinIO from the official source, once
 infra/services.sh up                      # Neo4j, Redis, MinIO on 127.0.0.1
 infra/fabric.sh up                        # Fabric test-network + channel rbpre
