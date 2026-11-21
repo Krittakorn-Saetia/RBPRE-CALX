@@ -2,8 +2,10 @@
 """Experiments 2-4 on one growing patient history.
 
   Exp 2  longitudinal retrieval latency vs N linked records: RBPRE-CALX
-         Phase 4 (admission, graph discovery, filtering, linkage, record and
-         linkage verification); baselines locate the patient's records by
+         T_ret of Eq. 158 (admission, historical-pseudonym resolution, graph
+         discovery, metadata-opening verification and record-level filtering);
+         the whole of Phase 4 including verification is also kept, as variant
+         "with verification". Baselines locate the patient's records by
          repository scan plus their own per-record validation.
   Exp 3  cross-domain transformation cost vs N: RBPRE-CALX Phase 5 on T_auth,
          with a re-key cache miss (new session) and hit (same session);
@@ -27,31 +29,48 @@ import time
 
 from baselines.common import Prims
 from baselines.schemes import Luo31, PlainPRE, Wang25, Yan27
-from experiments.harness import save_machine, services, write_rows
+from experiments.harness import quiet, save_machine, services, write_rows
 from experiments.workload import World
 from rbpre import rbabpre as rb
 from rbpre.protocol import Timer
 
 VERIFY_STEPS = ("p4.fetch", "p4.chain_records", "p4.verify_records", "p4.chain_linkage_state",
                 "p4.verify_linkage", "p4.merkle_update", "p4.chain_linkage")
+# T_ret = T_Map + T_graph + O(k_c (T_Meta + T_policy)) (Eq. 158): admission,
+# historical-pseudonym resolution and graph discovery, metadata-opening
+# verification and record-level filtering. Verification (Eq. 159) is Exp 4.
+RET_STEPS = ("p4.admission", "p4.graph", "p4.filter")
 
 
 class Series:
-    """Run a measurement up to `runs` times, capping heavy series."""
+    """Run a measurement `runs` times after one discarded warm-up run.
+
+    If the warm-up already takes longer than heavy_s, the series is heavy: the
+    warm-up counts as the first measured run (these series are long,
+    CPU-bound and stable) and the series stops at runs_heavy runs. Every run is
+    timed without garbage-collector pauses (harness.quiet).
+    """
 
     def __init__(self, runs: int, runs_heavy: int, heavy_s: float):
         self.runs, self.runs_heavy, self.heavy_ms = runs, runs_heavy, heavy_s * 1000
 
-    def __call__(self, fn) -> list[float]:
-        xs, limit = [], self.runs
-        for _ in range(self.runs):
+    @staticmethod
+    def _once(fn) -> float:
+        with quiet():
             t0 = time.perf_counter_ns()
             fn()
-            xs.append((time.perf_counter_ns() - t0) / 1e6)
+            return (time.perf_counter_ns() - t0) / 1e6
+
+    def __call__(self, fn, warmup: bool = True) -> list[float]:
+        xs, limit = [], self.runs
+        if warmup:
+            first = self._once(fn)
+            if first > self.heavy_ms:
+                xs, limit = [first], min(self.runs, self.runs_heavy)
+        while len(xs) < limit:
+            xs.append(self._once(fn))
             if len(xs) == 1 and xs[0] > self.heavy_ms:
                 limit = min(self.runs, self.runs_heavy)
-            if len(xs) >= limit:
-                break
         return xs
 
 
@@ -107,28 +126,34 @@ def main() -> None:
         # ---------------------------------------------------------- RBPRE-CALX
         sizes, run = {}, [0]
 
-        def rbpre_round():
+        def rbpre_round(record: bool = True):
             r = run[0]
-            run[0] += 1
             se = s.authorize(doc, target.patient, "treatment", "cardiology")
             tt = Timer()
             ta = s.discover(se, tt)
-            sizes.update(t_d=len(s.last_candidates), t_auth=len(ta))
-            e2s.extend(dict(n=n, run=r, step=k, ms=v) for k, v in tt.ms.items())
-            e2.append(dict(scheme="RBPRE-CALX", variant="filtered", n=n, run=r, ms=tt.total(),
-                           t_d=len(s.last_candidates), t_auth=len(ta)))
-            e4.append(dict(scheme="RBPRE-CALX", variant="filtered", n=n, verified=len(t_f_set), run=r,
-                           ms=sum(tt.ms.get(k, 0.0) for k in VERIFY_STEPS)))
             miss = Timer()
             out = s.transform(se, ta, miss)
             hit = Timer()
             s.transform(se, ta, hit)
+            s.pending_anchors.clear()
+            sizes.update(t_d=len(s.last_candidates), t_auth=len(ta))
+            if not record:  # warm-up
+                return
+            run[0] += 1
+            e2s.extend(dict(n=n, run=r, step=k, ms=v) for k, v in tt.ms.items())
+            t_ret = sum(v for k, v in tt.ms.items() if k.startswith(RET_STEPS))
+            e2.append(dict(scheme="RBPRE-CALX", variant="filtered", n=n, run=r, ms=t_ret,
+                           t_d=len(s.last_candidates), t_auth=len(ta)))
+            e2.append(dict(scheme="RBPRE-CALX", variant="with verification", n=n, run=r, ms=tt.total(),
+                           t_d=len(s.last_candidates), t_auth=len(ta)))
+            e4.append(dict(scheme="RBPRE-CALX", variant="filtered", n=n, verified=len(t_f_set), run=r,
+                           ms=sum(tt.ms.get(k, 0.0) for k in VERIFY_STEPS)))
             for variant, tm in (("rk-miss", miss), ("rk-hit", hit)):
                 e3.append(dict(scheme="RBPRE-CALX", variant=variant, n=n, run=r, ms=tm.total(),
                                records=len(out)))
-            s.pending_anchors.clear()
 
-        ser(rbpre_round)
+        Series._once(lambda: rbpre_round(record=False))
+        ser(rbpre_round, warmup=False)
         for table in (e2, e3, e4):  # number of runs behind each RBPRE-CALX mean
             for x in table:
                 if x["scheme"] == "RBPRE-CALX" and x["n"] == n and x.get("variant") != "first":

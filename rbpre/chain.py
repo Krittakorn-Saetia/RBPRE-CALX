@@ -1,12 +1,16 @@
-"""rbpre.chain: client for the RBPRE-CALX chaincode (chaincode/rbpre).
+"""rbpre.chain: clients for the RBPRE-CALX chaincode (chaincode/rbpre).
 
-FabricLedger talks to the running Hyperledger Fabric test-network through the
-`peer` CLI. A write is timed from submit to commit (--waitForEvent), so its
-latency includes endorsement, ordering (BatchTimeout 1 s) and validation; a
-read is a `peer chaincode query`. Every call returns (result, elapsed_ms).
+GatewayLedger (default) talks to the peer's Fabric Gateway service through the
+fabgw helper: one persistent gRPC connection, so a query costs a network
+round trip rather than a process start. A write is timed from submission
+until it is committed and applied by the synchronized state mirror.
+mirror_state() reads that mirror: the latest synchronized finalized state.
 
-Batch operations are split into transactions that stay below the peer CLI's
-single-argument limit; they return (result, elapsed_ms, n_transactions).
+FabricLedger uses the `peer` CLI (one process per call, as FLEX-DIAM V3 did).
+It is kept for comparison; it has no mirror, so mirror_state() queries.
+
+Every call returns (result, elapsed_ms). Batch operations are split into
+transactions below a size limit and return (result, elapsed_ms, n_tx).
 
 MemoryLedger mirrors the contract in a Python dict. It exists only so that the
 protocol logic can be tested without Docker; it has no latency, and experiment
@@ -17,13 +21,20 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import subprocess
+import threading
 import time
+from pathlib import Path
 
 # Linux caps one command-line argument at 128 KiB (MAX_ARG_STRLEN).
 MAX_ARG_BYTES = 120_000
+# Gateway transactions are bounded by the ordering service's preferred block
+# size (512 KB in the test-network), not by the command line.
+GATEWAY_MAX_BYTES = 480_000
 STATUS = ("active", "revoked", "superseded")
+FABGW = Path(os.environ.get("RBPRE_FABGW", Path(__file__).resolve().parent.parent / "fabgw" / "fabgw"))
 
 
 def _j(o) -> str:
@@ -46,6 +57,8 @@ def _chunks(items: list, max_bytes: int = MAX_ARG_BYTES):
 
 class _LedgerAPI:
     is_real = False
+    has_mirror = False
+    max_arg = MAX_ARG_BYTES
 
     def invoke(self, fn: str, *args) -> tuple[str, float]:
         raise NotImplementedError
@@ -53,9 +66,13 @@ class _LedgerAPI:
     def query(self, fn: str, *args) -> tuple[str, float]:
         raise NotImplementedError
 
+    def mirror_state(self, req: dict[str, list[str]]) -> dict:
+        """Synchronized finalized state; without a mirror this is a query."""
+        return self.get_state(req)[0]
+
     def _batch_invoke(self, fn: str, items: list):
         total, n_tx, count = 0.0, 0, 0
-        for chunk in _chunks(items):
+        for chunk in _chunks(items, self.max_arg):
             out, ms = self.invoke(fn, _j(chunk))
             total += ms
             n_tx += 1
@@ -110,7 +127,7 @@ class _LedgerAPI:
         flat = [(k, i) for k, ids in req.items() for i in ids]
         out: dict[str, dict] = {k: {} for k in req}
         total, n_q = 0.0, 0
-        for chunk in _chunks(flat):
+        for chunk in _chunks(flat, self.max_arg):
             sub: dict[str, list[str]] = {}
             for k, i in chunk:
                 sub.setdefault(k, []).append(i)
@@ -192,10 +209,78 @@ class FabricLedger(_LedgerAPI):
         return r.stdout.strip(), ms
 
 
+class GatewayLedger(_LedgerAPI):
+    """Fabric Gateway back end with a synchronized state mirror (fabgw)."""
+
+    is_real = True
+    has_mirror = True
+    max_arg = GATEWAY_MAX_BYTES
+
+    def __init__(self, infra: str | None = None, channel: str | None = None, cc: str | None = None,
+                 binary: Path | str = FABGW):
+        if not Path(binary).exists():
+            raise RuntimeError(f"{binary} not found; build it with: cd fabgw && go build -o fabgw .")
+        infra = infra or os.environ.get("FLEX_INFRA", os.path.expanduser("~/flex-diam"))
+        env = dict(os.environ, FABGW_TN=f"{infra}/fabric-samples/test-network",
+                   FABGW_CHANNEL=channel or os.environ.get("RBPRE_CHANNEL", "rbpre"),
+                   FABGW_CC=cc or os.environ.get("RBPRE_CC", "rbpre"))
+        self._p = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   text=True, bufsize=1, env=env)
+        self._wlock, self._plock = threading.Lock(), threading.Lock()
+        self._next, self._pending = 0, {}
+        threading.Thread(target=self._reader, daemon=True).start()
+        self.last: dict = {}
+        self.call("barrier")  # the mirror has caught up with the chain
+
+    def _reader(self) -> None:
+        for line in self._p.stdout:
+            resp = json.loads(line)
+            with self._plock:
+                q = self._pending.pop(resp.get("id"), None)
+            if q is not None:
+                q.put(resp)
+
+    def call(self, op: str, **kw) -> dict:
+        q: queue.Queue = queue.Queue(1)
+        with self._plock:
+            self._next += 1
+            rid = self._next
+            self._pending[rid] = q
+        with self._wlock:
+            self._p.stdin.write(_j(dict(kw, id=rid, op=op)) + "\n")
+            self._p.stdin.flush()
+        resp = q.get(timeout=600)
+        if not resp.pop("ok"):
+            raise RuntimeError(f"fabgw {op} failed: {resp.get('error')}")
+        return resp
+
+    def invoke(self, fn: str, *args):
+        t0 = time.perf_counter_ns()
+        r = self.call("submit", fn=fn, args=[str(a) for a in args])
+        ms = (time.perf_counter_ns() - t0) / 1e6
+        self.last = dict(commit_ms=r["commit_ms"], sync_ms=r["sync_ms"], block=r["block"])
+        return f'status:200 payload:"{r["result"]}"', ms
+
+    def query(self, fn: str, *args):
+        t0 = time.perf_counter_ns()
+        r = self.call("evaluate", fn=fn, args=[str(a) for a in args])
+        return r["result"], (time.perf_counter_ns() - t0) / 1e6
+
+    def mirror_state(self, req: dict[str, list[str]]) -> dict:
+        return self.call("mirror_get", req=req)["state"]
+
+    def close(self) -> None:
+        if self._p.poll() is None:
+            self._p.stdin.close()
+            self._p.wait(timeout=30)
+        self._p.stdout.close()
+
+
 class MemoryLedger(_LedgerAPI):
     """In-process mirror of rbpre_contract.go for offline logic tests only."""
 
     is_real = False
+    has_mirror = True
 
     def __init__(self):
         self.kv: dict[str, object] = {}

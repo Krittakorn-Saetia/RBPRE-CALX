@@ -197,9 +197,17 @@ class Retrieved:
 
 
 class RBPRESystem:
-    def __init__(self, ledger, graph, store, cache, zk: ZK, m: int = 10, curve: str = "SS512"):
+    """state_mode: "sync" reads the gateway's synchronized finalized state
+    (the chain mirror kept from commit events); "query" asks the chaincode on
+    every check."""
+
+    def __init__(self, ledger, graph, store, cache, zk: ZK, m: int = 10, curve: str = "SS512",
+                 state_mode: str = "sync"):
         self.ledger, self.graph, self.store, self.cache, self.zk = ledger, graph, store, cache, zk
         self.m = m
+        if state_mode not in ("sync", "query"):
+            raise ValueError("state_mode is 'sync' or 'query'")
+        self.state_mode = state_mode
         self.scheme = CPABPRE(curve)
         self.hospitals: dict[str, Hospital] = {}
         # protected consent service state (off-chain, Eq. 24, 28, 49)
@@ -214,6 +222,12 @@ class RBPRESystem:
         self.linkage: dict[tuple, bytes] = {}        # (RID*, H_A, H_B, ComC, Purpose, e) -> FlagID
         self.trees: dict[str, merkle.MerkleTree] = {}  # PID* -> M_PID*
         self.pending_anchors: list[tuple[str, list]] = []  # asynchronous submissions
+
+    def state(self, req: dict[str, list[str]]) -> dict:
+        """Chain state for the checks of Eq. 62, 70, 79-82 and 86-88."""
+        if self.state_mode == "sync":
+            return self.ledger.mirror_state(req)
+        return self.ledger.get_state(req)[0]
 
     # ================================================================ Phase 1
 
@@ -385,7 +399,7 @@ class RBPRESystem:
         h_ctx (Eq. 51). t_g overrides the issuance time (freshness tests only)."""
         e, pid_star = p.e, p.pid_star()
         with t.step("p3.gw_challenge"):
-            st, _, _ = self.ledger.get_state({"did": [doc.did]})
+            st = self.state({"did": [doc.did]})
             if st["did"].get(doc.did, {}).get("pk") != doc.zk_pk:
                 raise Rejected("pk_D not bound to DID_D")
             pk_d = st["did"][doc.did]["pk"]
@@ -437,7 +451,7 @@ class RBPRESystem:
         if dele is None:
             raise Rejected("no delegation for this source-target pair")
         with t.step("p3.gw_state"):
-            st, _, _ = self.ledger.get_state({"cred": [doc.cid.hex()], "cons": [p.com_c.hex()],
+            st = self.state({"cred": [doc.cid.hex()], "cons": [p.com_c.hex()],
                                               "del": [dele["h"]], "epoch": [p.handle]})
             self._check_state(st, doc, p, dele, t_now, e)
             if not sig.verify(self.cs_key.pk, sigma_c, H(p.com_c, purpose, scope, e, open_c["t_c"])):
@@ -511,7 +525,7 @@ class RBPRESystem:
                 raise Rejected("holder-session binding failed")
         dele = self.delegations[(s.patient.home, s.doctor.domain, s.pid_star)]
         with t.step(label + ".chain"):
-            st, _, _ = self.ledger.get_state({"cred": [s.doctor.cid.hex()], "cons": [s.chi.com_c.hex()],
+            st = self.state({"cred": [s.doctor.cid.hex()], "cons": [s.chi.com_c.hex()],
                                               "del": [dele["h"]], "epoch": [s.patient.handle]})
         with t.step(label + ".check"):
             self._check_state(st, s.doctor, s.patient, dele, t_now, s.chi.e)
@@ -561,7 +575,7 @@ class RBPRESystem:
         with t.step("p4.fetch"):
             blobs = self.store.get_many([c["uri"] for c in t_f])
         with t.step("p4.chain_records"):
-            st, _, _ = self.ledger.get_state({"rec": [c["rid"] for c in t_f]})
+            st = self.state({"rec": [c["rid"] for c in t_f]})
         with t.step("p4.verify_records"):
             ok = []
             for c, (ct_m, ct_k) in zip(t_f, blobs):
@@ -589,7 +603,7 @@ class RBPRESystem:
                 self.ledger.set_root(pid_hex, tree.root.hex())
         tree = self.trees.get(pid_hex)
         with t.step("p4.chain_linkage_state"):
-            st, _, _ = self.ledger.get_state({"flag": [c["flag"].hex() for c in ok], "root": [pid_hex]})
+            st = self.state({"flag": [c["flag"].hex() for c in ok], "root": [pid_hex]})
         with t.step("p4.verify_linkage"):
             root = bytes.fromhex(st["root"].get(pid_hex, "00"))
             index = {leaf: i for i, leaf in enumerate(tree.leaves)} if tree else {}
@@ -674,7 +688,7 @@ class RBPRESystem:
         with t.step("p5.proxy_fetch"):
             blobs = self.store.get_many([c["uri"] for c in targets])
         with t.step("p5.proxy_chain"):
-            st, _, _ = self.ledger.get_state({"rec": [c["rid"] for c in targets]})
+            st = self.state({"rec": [c["rid"] for c in targets]})
         out = []
         for c, (ct_m, ct_k_b) in zip(targets, blobs):
             op = c["open"]

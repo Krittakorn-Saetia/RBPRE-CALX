@@ -7,7 +7,9 @@ Every driver writes raw per-run CSV rows to results/<run>/ (RBPRE_RUN, default
 
 from __future__ import annotations
 
+import contextlib
 import csv
+import gc
 import json
 import os
 import platform
@@ -45,6 +47,18 @@ def mean_sd(xs: list[float]) -> tuple[float, float]:
     return statistics.fmean(xs), (statistics.stdev(xs) if len(xs) > 1 else 0.0)
 
 
+@contextlib.contextmanager
+def quiet():
+    """Measurement section without Python garbage-collector pauses: collect
+    first, keep the cyclic collector off while timing, re-enable after."""
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
+
+
 def timed(fn, *a, **k) -> tuple[object, float]:
     t0 = time.perf_counter_ns()
     r = fn(*a, **k)
@@ -60,7 +74,7 @@ def _ver(pkg: str) -> str:
 
 def machine() -> dict:
     """Hardware and software description, written next to the results."""
-    info = {"python": platform.python_version(), "platform": platform.platform(),
+    info = {"chain_client": CHAIN, "python": platform.python_version(), "platform": platform.platform(),
             "charm": _ver("charm-crypto-framework"), "cryptography": _ver("cryptography"),
             "neo4j_driver": _ver("neo4j"), "redis_py": _ver("redis"), "minio_py": _ver("minio")}
     try:
@@ -80,10 +94,15 @@ def save_machine() -> None:
     out_path("machine.json").write_text(json.dumps(machine(), indent=2))
 
 
+CHAIN = os.environ.get("RBPRE_CHAIN", "gateway")  # gateway | cli
+
+
 def services(fabric: bool = True, bucket: str = "ehr"):
-    """(ledger, graph, store, cache) on the real services."""
+    """(ledger, graph, store, cache) on the real services. The chain client is
+    the Fabric Gateway with its synchronized mirror (RBPRE_CHAIN=gateway, the
+    default) or the peer CLI (RBPRE_CHAIN=cli); every scheme uses the same one."""
     from rbpre.cache import AuthCache
-    from rbpre.chain import FabricLedger, MemoryLedger
+    from rbpre.chain import FabricLedger, GatewayLedger, MemoryLedger
     from rbpre.graph import RetrievalGraph
     from rbpre.storage import EHRStore
 
@@ -91,4 +110,8 @@ def services(fabric: bool = True, bucket: str = "ehr"):
     graph.setup()
     store = EHRStore(bucket=bucket)
     store.setup()
-    return (FabricLedger() if fabric else MemoryLedger()), graph, store, AuthCache()
+    if not fabric:
+        ledger = MemoryLedger()
+    else:
+        ledger = GatewayLedger() if CHAIN == "gateway" else FabricLedger()
+    return ledger, graph, store, AuthCache()

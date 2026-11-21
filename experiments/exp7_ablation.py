@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import argparse
 
-from experiments.harness import save_machine, services, write_rows
+from experiments.harness import quiet, save_machine, services, write_rows
 from experiments.workload import World
 from rbpre.protocol import Timer
 
@@ -63,9 +63,20 @@ def main() -> None:
         w.grow(target, args.n, ratio)
         p = target.patient
         sess = s.authorize(doc, p, "treatment", "cardiology")
-        s.transform(sess, s.discover(sess))          # warm-up: linkage and re-key states
+        ref = s.discover(sess)                      # warm-up: linkage entries
+        s.transform(sess, ref)
         s.discover(sess, early_filter=False)        # warm-up for the unfiltered linkage set
         s.pending_anchors.clear()
+        # one record per (hospital, class): enough to create every re-key state of a session
+        prime = list({(c["hosp"], c["open"]["meta"]["cls"]): c for c in ref}.values())
+
+        def fresh_session():
+            """A new valid session with its re-key states cached (sessions live
+            at most SESSION_LIFETIME_S, so each run starts its own)."""
+            se = s.authorize(doc, p, "treatment", "cardiology")
+            s.transform(se, [dict(c) for c in prime])
+            s.pending_anchors.clear()
+            return se
 
         def full(t):
             s.transform(sess, s.discover(sess, t), t)
@@ -87,10 +98,15 @@ def main() -> None:
 
         variants = [("full", full), ("(i) no reuse", no_reuse), ("(ii) no early filter", no_filter),
                     ("(iii) no selective PRE", no_selective), ("(iv) no filter + no selective", neither)]
+        for name, fn in variants:  # warm-up, not recorded
+            sess = fresh_session()
+            fn(Timer())
         for r in range(args.runs):
             for name, fn in variants:
+                sess = fresh_session()
                 t = Timer()
-                fn(t)
+                with quiet():
+                    fn(t)
                 s.pending_anchors.clear()
                 rows.append(dict(variant=name, ratio=ratio, n=args.n, t_auth=len(target.authorized), run=r,
                                  ms=t.total()))

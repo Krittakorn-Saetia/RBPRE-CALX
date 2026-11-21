@@ -29,6 +29,7 @@ with consensus, and [25] blacklists at its authority (T_H).
 from __future__ import annotations
 
 import argparse
+import gc
 
 from baselines.common import Prims
 from baselines.schemes import Luo31, Wang25, Yan27
@@ -86,6 +87,8 @@ def main() -> None:
 
         for sess_n in args.sessions:
             for r in range(args.runs):
+                gc.collect()
+                gc.disable()  # no collector pauses inside the timed events (re-enabled below)
                 # ---- policy update, with steady-state and first retrieval around it
                 live = populate(doc, sess_n)
                 t = Timer()
@@ -124,6 +127,7 @@ def main() -> None:
                 s.revoke_credential(other, t)
                 record("credential revocation", n, sess_n, r, t)
                 s.pending_anchors.clear()
+                gc.enable()
             cur = [x for x in rows if x["n"] == n and x["sessions"] == sess_n]
             print(f"N={n:<6} S={sess_n:<4} " + "  ".join(
                 f"{ev}: {sum(x['ms'] for x in cur if x['event'] == ev) / args.runs:7.0f}"

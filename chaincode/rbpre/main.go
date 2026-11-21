@@ -11,7 +11,10 @@ import (
 )
 
 func main() {
-	cc, err := contractapi.NewChaincode(&RBPREContract{})
+	contract := &RBPREContract{}
+	contract.TransactionContextHandler = new(RBContext)
+	contract.AfterTransaction = emitChanges
+	cc, err := contractapi.NewChaincode(contract)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create chaincode: %v\n", err)
 		os.Exit(1)

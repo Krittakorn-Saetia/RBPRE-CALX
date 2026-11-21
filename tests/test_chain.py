@@ -78,5 +78,32 @@ class TestFabricLedger(_Scenario, unittest.TestCase):
         self.ledger = FabricLedger()
 
 
+@unittest.skipUnless(_peer_up(), "Fabric test-network not running")
+class TestGatewayLedger(_Scenario, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from rbpre.chain import GatewayLedger
+
+        cls.ledger = GatewayLedger()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ledger.close()
+
+    def test_mirror_is_synchronized_at_commit(self):
+        """A committed write is visible in the mirror as soon as invoke returns."""
+        L = self.ledger
+        u = os.urandom(6).hex()
+        L.register_credentials([{"id": f"cid-{u}", "owner": f"did-{u}", "t": 1_800_000_000}])
+        self.assertEqual(L.mirror_state({"cred": [f"cid-{u}"]})["cred"][f"cid-{u}"]["status"], "active")
+        L.set_status("cred", f"cid-{u}", "revoked")
+        self.assertEqual(L.mirror_state({"cred": [f"cid-{u}"]})["cred"][f"cid-{u}"]["status"], "revoked")
+        self.assertGreaterEqual(L.last["sync_ms"], 0.0)
+        recs = [{"id": f"r{i}-{u}", "v": f"c{i}"} for i in range(50)]
+        L.anchor_records(recs)
+        q, _, _ = L.get_state({"rec": [r["id"] for r in recs]})
+        self.assertEqual(L.mirror_state({"rec": [r["id"] for r in recs]}), q)
+
+
 if __name__ == "__main__":
     unittest.main()

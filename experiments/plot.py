@@ -34,7 +34,9 @@ SLOTS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#625
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]
 SCHEMES = ["RBPRE-CALX", "[25]", "[27]", "[31]", "PRE"]
 INK, INK2, GRID, AXIS = "#0b0b0b", "#52514e", "#e1e0d9", "#c3c2b7"
-STYLE = {"all": "-", "filtered": "--", "rk-miss": "-", "rk-hit": ":", "first": "-."}
+STYLE = {"all": "-", "filtered": "--", "rk-miss": "-", "rk-hit": ":", "first": "-.",
+         "with verification": "-.", "Fresh": "-", "Reuse 10/session": "--", "Reuse 50/session": ":",
+         "Reuse all/session": "-."}
 
 plt.rcParams.update({
     "font.family": "sans-serif", "font.size": 9, "axes.edgecolor": AXIS, "axes.labelcolor": INK2,
@@ -109,7 +111,8 @@ def label_variant(k):
     scheme, variant = k
     if scheme == "RBPRE-CALX":
         return {"filtered": "RBPRE-CALX", "rk-miss": "RBPRE-CALX (re-key miss)",
-                "rk-hit": "RBPRE-CALX (re-key hit)", "first": "RBPRE-CALX (first, new linkage)"}.get(variant, scheme)
+                "rk-hit": "RBPRE-CALX (re-key hit)", "first": "RBPRE-CALX (first, new linkage)",
+                "with verification": "RBPRE-CALX (with verification)"}.get(variant, f"RBPRE-CALX {variant}")
     return f"{scheme} ({'all records' if variant == 'all' else 'given T_auth'})"
 
 
@@ -185,13 +188,11 @@ def main() -> None:
     if rows:
         for r in rows:
             r["ms"] = r["total_ms"]
-            r["series"] = r["scheme"]
         series_plot(out, "e1b_authorization", rows, "k", "Cumulative authorization latency", "requests k",
-                    key=("series",), order=["RBPRE-CALX Fresh", "RBPRE-CALX Reuse", "[25]", "[27]", "[31]"],
-                    label=lambda k: k[0])
+                    label=lambda k: f"RBPRE-CALX {k[1]}" if k[0] == "RBPRE-CALX" else k[0])
 
     for name, fname, x, title, xl in (
-            ("e2_runs", "e2_retrieval", "n", "Longitudinal retrieval latency", "linked EHR records N"),
+            ("e2_runs", "e2_retrieval", "n", "Longitudinal retrieval latency (T_ret)", "linked EHR records N"),
             ("e3_runs", "e3_transformation", "n", "Cross-domain transformation cost", "linked EHR records N"),
             ("e4_runs", "e4_verification", "verified", "Retrieval verification overhead", "verified records"),
             ("e6_runs", "e6_hospitals", "hospitals", "End-to-end retrieval vs hospitals", "hospitals H")):

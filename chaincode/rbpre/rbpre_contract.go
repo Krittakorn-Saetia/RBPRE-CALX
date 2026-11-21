@@ -17,6 +17,11 @@
 //
 // Lifecycle states take values in {active, revoked, superseded}. All batch
 // arguments are JSON arrays so that one transaction can carry many entries.
+//
+// State synchronization: every transaction that writes state emits one
+// chaincode event "state" whose payload is {kind: {id: value}}, in the same
+// shape as GetState returns. Gateways and proxies keep a synchronized mirror
+// of the finalized state by following these events from block 0.
 package main
 
 import (
@@ -30,18 +35,38 @@ type RBPREContract struct {
 	contractapi.Contract
 }
 
-const (
-	pDID   = "did|"
-	pCred  = "cred|"
-	pCons  = "cons|"
-	pDel   = "del|"
-	pEpoch = "epoch|"
-	pRec   = "rec|"
-	pFlag  = "flag|"
-	pRoot  = "root|"
-	pAuth  = "auth|"
-	pShare = "share|"
-)
+// RBContext is the per-invocation transaction context; it collects the
+// state changes of one transaction for the "state" event.
+type RBContext struct {
+	contractapi.TransactionContext
+	changes map[string]map[string]json.RawMessage
+}
+
+func (c *RBContext) record(kind, id string, v []byte) {
+	if c.changes == nil {
+		c.changes = map[string]map[string]json.RawMessage{}
+	}
+	if c.changes[kind] == nil {
+		c.changes[kind] = map[string]json.RawMessage{}
+	}
+	c.changes[kind][id] = rawValue(v)
+}
+
+// emitChanges is the contract's AfterTransaction hook.
+func emitChanges(ctx contractapi.TransactionContextInterface) error {
+	rc, ok := ctx.(*RBContext)
+	if !ok || len(rc.changes) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(rc.changes)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().SetEvent("state", b)
+}
+
+var prefixes = map[string]string{"did": "did|", "cred": "cred|", "cons": "cons|", "del": "del|",
+	"epoch": "epoch|", "rec": "rec|", "flag": "flag|", "root": "root|", "auth": "auth|", "share": "share|"}
 
 type DIDRec struct {
 	DID    string `json:"did"`
@@ -66,12 +91,37 @@ type EpochRec struct {
 
 var statusOK = map[string]bool{"active": true, "revoked": true, "superseded": true}
 
-func putJSON(ctx contractapi.TransactionContextInterface, key string, v any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
+// rawValue renders a stored value as JSON: objects as they are, anything
+// else as a JSON string.
+func rawValue(b []byte) json.RawMessage {
+	if len(b) > 0 && (b[0] == '{' || b[0] == '[') && json.Valid(b) {
+		return json.RawMessage(b)
+	}
+	q, _ := json.Marshal(string(b))
+	return json.RawMessage(q)
+}
+
+// put writes kind|id and records the change for the state event.
+func put(ctx contractapi.TransactionContextInterface, kind, id string, v any) error {
+	var b []byte
+	switch x := v.(type) {
+	case []byte:
+		b = x
+	case string:
+		b = []byte(x)
+	default:
+		var err error
+		if b, err = json.Marshal(v); err != nil {
+			return err
+		}
+	}
+	if err := ctx.GetStub().PutState(prefixes[kind]+id, b); err != nil {
 		return err
 	}
-	return ctx.GetStub().PutState(key, b)
+	if rc, ok := ctx.(*RBContext); ok {
+		rc.record(kind, id, b)
+	}
+	return nil
 }
 
 func txTime(ctx contractapi.TransactionContextInterface) int64 {
@@ -94,7 +144,7 @@ func (c *RBPREContract) RegisterDIDs(ctx contractapi.TransactionContextInterface
 		if r.DID == "" || r.PK == "" {
 			return 0, fmt.Errorf("did and pk are required")
 		}
-		if err := putJSON(ctx, pDID+r.DID, r); err != nil {
+		if err := put(ctx, "did", r.DID, r); err != nil {
 			return 0, err
 		}
 	}
@@ -112,7 +162,7 @@ func (c *RBPREContract) RegisterCredentials(ctx contractapi.TransactionContextIn
 		return 0, err
 	}
 	for _, r := range recs {
-		if err := putJSON(ctx, pCred+r.ID, Lifecycle{Owner: r.Owner, T: r.T, Status: "active"}); err != nil {
+		if err := put(ctx, "cred", r.ID, Lifecycle{Owner: r.Owner, T: r.T, Status: "active"}); err != nil {
 			return 0, err
 		}
 	}
@@ -129,12 +179,12 @@ func (c *RBPREContract) RegisterConsent(ctx contractapi.TransactionContextInterf
 			return err
 		}
 	}
-	return putJSON(ctx, pCons+comC, Lifecycle{E: e, T: tC, Status: "active"})
+	return put(ctx, "cons", comC, Lifecycle{E: e, T: tC, Status: "active"})
 }
 
 // RegisterDelegation stores DRec_ctx = (H(DelTok), e, t_del, active) (Eq. 34).
 func (c *RBPREContract) RegisterDelegation(ctx contractapi.TransactionContextInterface, hDel string, e int, tDel int64) error {
-	return putJSON(ctx, pDel+hDel, Lifecycle{E: e, T: tDel, Status: "active"})
+	return put(ctx, "del", hDel, Lifecycle{E: e, T: tDel, Status: "active"})
 }
 
 // SetStatus changes the lifecycle status of a credential, consent,
@@ -143,11 +193,10 @@ func (c *RBPREContract) SetStatus(ctx contractapi.TransactionContextInterface, k
 	if !statusOK[status] {
 		return fmt.Errorf("bad status %q", status)
 	}
-	prefix := map[string]string{"cred": pCred, "cons": pCons, "del": pDel, "flag": pFlag}[kind]
-	if prefix == "" {
+	if kind != "cred" && kind != "cons" && kind != "del" && kind != "flag" {
 		return fmt.Errorf("bad kind %q", kind)
 	}
-	b, err := ctx.GetStub().GetState(prefix + id)
+	b, err := ctx.GetStub().GetState(prefixes[kind] + id)
 	if err != nil {
 		return err
 	}
@@ -159,7 +208,7 @@ func (c *RBPREContract) SetStatus(ctx contractapi.TransactionContextInterface, k
 		return err
 	}
 	l.Status = status
-	return putJSON(ctx, prefix+id, l)
+	return put(ctx, kind, id, l)
 }
 
 // ---------------------------------------------------------------- revocation
@@ -168,7 +217,7 @@ func (c *RBPREContract) SetStatus(ctx contractapi.TransactionContextInterface, k
 // and returns the new epoch (Eq. 96-97).
 func (c *RBPREContract) AdvanceEpoch(ctx contractapi.TransactionContextInterface, handle, comRev string) (int, error) {
 	var ep EpochRec
-	b, err := ctx.GetStub().GetState(pEpoch + handle)
+	b, err := ctx.GetStub().GetState(prefixes["epoch"] + handle)
 	if err != nil {
 		return 0, err
 	}
@@ -179,7 +228,7 @@ func (c *RBPREContract) AdvanceEpoch(ctx contractapi.TransactionContextInterface
 	}
 	ep.E++
 	ep.ComRev = comRev
-	return ep.E, putJSON(ctx, pEpoch+handle, ep)
+	return ep.E, put(ctx, "epoch", handle, ep)
 }
 
 // ------------------------------------------------------- records and linkage
@@ -194,7 +243,7 @@ func (c *RBPREContract) AnchorRecords(ctx contractapi.TransactionContextInterfac
 		return 0, err
 	}
 	for _, r := range recs {
-		if err := ctx.GetStub().PutState(pRec+r.ID, []byte(r.V)); err != nil {
+		if err := put(ctx, "rec", r.ID, r.V); err != nil {
 			return 0, err
 		}
 	}
@@ -211,7 +260,7 @@ func (c *RBPREContract) AnchorFlags(ctx contractapi.TransactionContextInterface,
 		return 0, err
 	}
 	for _, r := range recs {
-		if err := putJSON(ctx, pFlag+r.ID, Lifecycle{E: r.E, Status: "active"}); err != nil {
+		if err := put(ctx, "flag", r.ID, Lifecycle{E: r.E, Status: "active"}); err != nil {
 			return 0, err
 		}
 	}
@@ -220,12 +269,12 @@ func (c *RBPREContract) AnchorFlags(ctx contractapi.TransactionContextInterface,
 
 // SetRoot anchors Root_PID* = H_Merkle(M_PID*) (Eq. 78).
 func (c *RBPREContract) SetRoot(ctx contractapi.TransactionContextInterface, pid, root string) error {
-	return ctx.GetStub().PutState(pRoot+pid, []byte(root))
+	return put(ctx, "root", pid, root)
 }
 
 // AnchorAuth anchors ComAuth (Eq. 65) with the transaction time.
 func (c *RBPREContract) AnchorAuth(ctx contractapi.TransactionContextInterface, com string) error {
-	return ctx.GetStub().PutState(pAuth+com, []byte(fmt.Sprint(txTime(ctx))))
+	return put(ctx, "auth", com, fmt.Sprint(txTime(ctx)))
 }
 
 // AnchorShares anchors [ComShare_i] (Eq. 90), submitted asynchronously.
@@ -234,9 +283,9 @@ func (c *RBPREContract) AnchorShares(ctx contractapi.TransactionContextInterface
 	if err := json.Unmarshal([]byte(comsJSON), &coms); err != nil {
 		return 0, err
 	}
-	t := []byte(fmt.Sprint(txTime(ctx)))
+	t := fmt.Sprint(txTime(ctx))
 	for _, com := range coms {
-		if err := ctx.GetStub().PutState(pShare+com, t); err != nil {
+		if err := put(ctx, "share", com, t); err != nil {
 			return 0, err
 		}
 	}
@@ -254,8 +303,6 @@ func (c *RBPREContract) GetState(ctx contractapi.TransactionContextInterface, re
 	if err := json.Unmarshal([]byte(reqJSON), &req); err != nil {
 		return "", err
 	}
-	prefixes := map[string]string{"did": pDID, "cred": pCred, "cons": pCons, "del": pDel,
-		"epoch": pEpoch, "rec": pRec, "flag": pFlag, "root": pRoot, "auth": pAuth, "share": pShare}
 	out := map[string]map[string]json.RawMessage{}
 	for kind, ids := range req {
 		prefix, ok := prefixes[kind]
@@ -271,12 +318,7 @@ func (c *RBPREContract) GetState(ctx contractapi.TransactionContextInterface, re
 			if b == nil {
 				continue
 			}
-			if json.Valid(b) && (b[0] == '{' || b[0] == '[') {
-				m[id] = json.RawMessage(b)
-			} else {
-				q, _ := json.Marshal(string(b))
-				m[id] = json.RawMessage(q)
-			}
+			m[id] = rawValue(b)
 		}
 		out[kind] = m
 	}

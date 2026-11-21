@@ -24,6 +24,8 @@ chaincode/rbpre/rbpre
 # development and dry runs on the build machine are not results
 results/dev/
 results/dryrun*/
+results/quick*/
+results/dev*/
 
 # OS / editor
 desktop.ini
@@ -32,3 +34,6 @@ Thumbs.db
 .DS_Store
 .vscode/
 .idea/
+
+# Fabric Gateway helper binary
+fabgw/fabgw

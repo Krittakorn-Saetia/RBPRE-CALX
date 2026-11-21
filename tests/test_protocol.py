@@ -28,12 +28,14 @@ class TestProtocol(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from rbpre.cache import AuthCache
-        from rbpre.chain import FabricLedger, MemoryLedger
+        from rbpre.chain import MemoryLedger
         from rbpre.graph import RetrievalGraph
         from rbpre.storage import EHRStore
         from rbpre.zk import ZK
 
-        ledger = FabricLedger() if os.environ.get("RBPRE_FABRIC") == "1" else MemoryLedger()
+        from rbpre.chain import GatewayLedger
+
+        ledger = GatewayLedger() if os.environ.get("RBPRE_FABRIC") == "1" else MemoryLedger()
         cls.graph = RetrievalGraph()
         cls.graph.setup()
         store = EHRStore(bucket="ehr-test")

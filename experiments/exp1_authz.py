@@ -5,8 +5,9 @@
       m in {5, 10, 15, 20, 25, 30}: R1CS constraints, setup, proving and
       verification time, proof and key sizes;
   (b) cumulative authorization latency for k requests: RBPRE-CALX Fresh (a new
-      holder-bound proof per request) and Reuse (sessions of --session-size
-      requests: one proof per session, ValidState for the others), and the
+      holder-bound proof per request) and Reuse for each --session-sizes value
+      (one proof per session of that many requests, ValidState against the
+      synchronized state for the others; 0 = one session for all k), and the
       authentication of [25], [27], [31];
   (c) freshness, replay and holder-binding checks: each attack once per run,
       with the outcome and the time to rejection.
@@ -24,7 +25,7 @@ import threading
 import time
 from dataclasses import replace
 
-from experiments.harness import save_machine, services, write_rows
+from experiments.harness import quiet, save_machine, services, write_rows
 from rbpre.protocol import Policy, RBPRESystem, Rejected, Timer, now
 from rbpre.zk import ZK, fe
 
@@ -68,10 +69,13 @@ def part_a(ms_list, runs) -> None:
                                        public_inputs=info["public"], compile_ms=info["compile_ms"],
                                        setup_ms=info["setup_ms"], pk_bytes=info["pk_bytes"],
                                        vk_bytes=info["vk_bytes"]))
+                pub, wit = statement(zk, circuit, m, keys)  # warm-up, not recorded
+                zk.verify(circuit, m, pub, zk.prove(circuit, m, pub, wit)["proof"])
                 for r in range(runs):
                     pub, wit = statement(zk, circuit, m, keys)
-                    p = zk.prove(circuit, m, pub, wit)
-                    v = zk.verify(circuit, m, pub, p["proof"])
+                    with quiet():
+                        p = zk.prove(circuit, m, pub, wit)
+                        v = zk.verify(circuit, m, pub, p["proof"])
                     assert v["valid"], (circuit, m)
                     run_rows.append(dict(circuit=circuit, m=m, run=r, witness_ms=p["witness_ms"],
                                          prove_ms=p["prove_ms"], prove_rtt_ms=p["rtt_ms"],
@@ -103,7 +107,14 @@ def world(fabric: bool, m: int):
 
 # ------------------------------------------------------------------ part (b)
 
-def part_b(s: RBPRESystem, doc, p, ks, runs, session_size, ledger) -> None:
+def part_b(s: RBPRESystem, doc, p, ks, runs, session_sizes, ledger) -> None:
+    """Cumulative authorization latency for k requests.
+
+    Fresh runs the whole of Phase 3 per request. Reuse with session size s
+    runs Phase 3 once per s requests (a fresh challenge and proof per
+    session); every other request runs ValidState (Eq. 70) against the
+    synchronized state. Session size 0 means one session for all k requests.
+    """
     from baselines.common import Prims
     from baselines.schemes import Luo31, Wang25, Yan27
 
@@ -111,38 +122,53 @@ def part_b(s: RBPRESystem, doc, p, ks, runs, session_size, ledger) -> None:
     base = [Wang25(pr, ledger), Yan27(pr, ledger, m=s.m), Luo31(pr, ledger)]
     base[2].bind(doc.did)
     rows, steps = [], []
+
+    def add(scheme, variant, k, r, ms, t=None, **kw):
+        rows.append(dict(scheme=scheme, variant=variant, k=k, run=r, total_ms=ms, **kw))
+        if t is not None:
+            steps.extend(dict(scheme=scheme, variant=variant, k=k, run=r, step=n_, ms=v) for n_, v in t.ms.items())
+
+    # warm-up, not recorded
+    s.valid_state(s.authorize(doc, p, "treatment", "cardiology"))
+    for b in base:
+        b.auth_request()
     for k in ks:
         for r in range(runs):
-            # RBPRE-CALX Fresh: one holder-bound proof per request
             t = Timer()
-            t0 = time.perf_counter_ns()
-            for _ in range(k):
-                s.authorize(doc, p, "treatment", "cardiology", t)
-            rows.append(dict(scheme="RBPRE-CALX Fresh", k=k, run=r, total_ms=(time.perf_counter_ns() - t0) / 1e6,
-                             proofs=k))
-            steps += [dict(scheme="RBPRE-CALX Fresh", k=k, run=r, step=n_, ms=v) for n_, v in t.ms.items()]
-            # RBPRE-CALX Reuse: one proof per session of `session_size` requests
-            t = Timer()
-            t0 = time.perf_counter_ns()
-            sess, proofs = None, 0
-            for i in range(k):
-                if i % session_size == 0:
-                    sess = s.authorize(doc, p, "treatment", "cardiology", t)
-                    proofs += 1
-                else:
-                    s.valid_state(sess, t, "reuse.valid_state")
-            rows.append(dict(scheme="RBPRE-CALX Reuse", k=k, run=r, total_ms=(time.perf_counter_ns() - t0) / 1e6,
-                             proofs=proofs))
-            steps += [dict(scheme="RBPRE-CALX Reuse", k=k, run=r, step=n_, ms=v) for n_, v in t.ms.items()]
-            for b in base:
+            with quiet():
                 t0 = time.perf_counter_ns()
                 for _ in range(k):
-                    b.auth_request()
-                rows.append(dict(scheme=b.name, k=k, run=r, total_ms=(time.perf_counter_ns() - t0) / 1e6))
+                    s.authorize(doc, p, "treatment", "cardiology", t)
+                ms = (time.perf_counter_ns() - t0) / 1e6
+            add("RBPRE-CALX", "Fresh", k, r, ms, t, proofs=k)
+            for size in session_sizes:
+                size_ = size or k
+                t = Timer()
+                with quiet():
+                    t0 = time.perf_counter_ns()
+                    sess, proofs = None, 0
+                    for i in range(k):
+                        if i % size_ == 0:
+                            sess = s.authorize(doc, p, "treatment", "cardiology", t)
+                            proofs += 1
+                        else:
+                            s.valid_state(sess, t, "reuse.valid_state")
+                    ms = (time.perf_counter_ns() - t0) / 1e6
+                add("RBPRE-CALX", f"Reuse {'all' if size == 0 else size}/session", k, r, ms, t, proofs=proofs)
+            for b in base:
+                with quiet():
+                    t0 = time.perf_counter_ns()
+                    for _ in range(k):
+                        b.auth_request()
+                    ms = (time.perf_counter_ns() - t0) / 1e6
+                add(b.name, "all", k, r, ms)
+            s.pending_anchors.clear()
         last = [x for x in rows if x["k"] == k]
+        series = dict.fromkeys((x["scheme"], x["variant"]) for x in last)
         print(f"  (b) k={k:<4} " + "  ".join(
-            f"{sch}: {sum(x['total_ms'] for x in last if x['scheme'] == sch) / runs:9.1f} ms"
-            for sch in dict.fromkeys(x["scheme"] for x in last)))
+            f"{a} {b_ if a == 'RBPRE-CALX' else ''}: "
+            f"{sum(x['total_ms'] for x in last if (x['scheme'], x['variant']) == (a, b_)) / runs:8.1f} ms"
+            for a, b_ in series))
         s.pending_anchors.clear()
     write_rows("e1b_runs.csv", rows)
     write_rows("e1b_steps.csv", steps)
@@ -232,7 +258,8 @@ def main() -> None:
     ap.add_argument("--m", type=int, nargs="+", default=[5, 10, 15, 20, 25, 30])
     ap.add_argument("--m-default", type=int, default=10)
     ap.add_argument("--k", type=int, nargs="+", default=[1, 10, 25, 50, 100])
-    ap.add_argument("--session-size", type=int, default=10)
+    ap.add_argument("--session-sizes", type=int, nargs="+", default=[10, 50, 0],
+                    help="requests per session for Reuse; 0 = one session for all k")
     ap.add_argument("--offline", action="store_true")
     args = ap.parse_args()
     save_machine()
@@ -241,7 +268,7 @@ def main() -> None:
     if "b" in args.parts or "c" in args.parts:
         s, zk, doc, p, _ = world(not args.offline, args.m_default)
         if "b" in args.parts:
-            part_b(s, doc, p, args.k, args.runs, args.session_size, s.ledger)
+            part_b(s, doc, p, args.k, args.runs, args.session_sizes, s.ledger)
         if "c" in args.parts:
             part_c(s, zk, doc, p, max(1, min(args.runs, 5)))
         zk.close()
