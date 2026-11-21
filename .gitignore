@@ -1,0 +1,33 @@
+# Private paper material: unpublished manuscript, confidential reviews,
+# response letter, submission link, internal plans. Never pushed.
+ref/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ZKP build artifacts (regenerable; large)
+zkp/build/
+*.ptau
+*.zkey
+*.wtns
+zkp/node_modules/
+
+# Go build outputs
+zkp/authz/authz
+chaincode/rbpre/rbpre
+
+# Raw outputs written to the repository root; kept results live under results/<run>/
+/exp*.csv
+/fig/
+*.log
+
+# OS / editor
+desktop.ini
+*.lnk
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
