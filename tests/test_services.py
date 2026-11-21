@@ -78,18 +78,19 @@ class TestCache(unittest.TestCase):
         self.assertIsNone(self.c.consume_nonce(n))  # replay
         self.assertIsNone(self.c.consume_nonce(os.urandom(16)))  # never issued
 
-    def test_epoch_invalidation(self):
-        pid, other = os.urandom(8).hex(), os.urandom(8).hex()
+    def test_tag_invalidation(self):
+        pid, other, doc = (os.urandom(8).hex() for _ in range(3))
         sid, kappa, sid2 = os.urandom(16), os.urandom(32), os.urandom(16)
-        self.c.put_session(sid, b"session", 60, pid)
-        self.c.put_rekey(kappa, b"rk-state", 60, pid)
-        self.c.put_session(sid2, b"other", 60, other)
+        self.c.put_session(sid, b"session", 60, [pid, doc])
+        self.c.put_rekey(kappa, b"rk-state", 60, [pid])
+        self.c.put_session(sid2, b"other", 60, [other])
         self.assertEqual(self.c.get_rekey(kappa), b"rk-state")
-        self.assertEqual(self.c.invalidate_patient(pid), 2)
+        self.assertEqual(self.c.invalidate(pid), 2)
         self.assertIsNone(self.c.get_session(sid))
         self.assertIsNone(self.c.get_rekey(kappa))
         self.assertEqual(self.c.get_session(sid2), b"other")
-        self.c.invalidate_patient(other)
+        self.assertEqual(self.c.invalidate(doc), 0)  # already gone
+        self.c.invalidate(other)
 
 
 if __name__ == "__main__":

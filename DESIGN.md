@@ -105,6 +105,45 @@ atomically with Redis GETDEL, so a replay finds no nonce.
 Setup is gnark's single-party `groth16.Setup`, whose toxic waste stays in
 memory and is discarded. A deployment would use gnark's MPC setup instead.
 
+## Protocol choices (rbpre/protocol.py)
+
+Points that the paper's text leaves open, and how the prototype fixes them:
+
+1. **Per-patient epochs.** Each patient has an epoch counter on chain under
+   the handle H("rbpre-epoch" ∥ PID). The handle is stable, so the chain can
+   link a patient's epoch updates to each other, but it reveals neither PID,
+   PID* nor the pseudonym mapping. An epoch advance writes ComRev_{e+1}.
+   **Existing records keep their creation pseudonyms** (PID*_e, RID*_e): the
+   consent service adds the new pseudonym to P_PID, and discovery runs over
+   all historical pseudonyms. An epoch advance therefore re-pseudonymizes no
+   stored record.
+2. **Delegation per source domain.** χ carries the delegation context ctx of
+   the patient's home hospital and the requester's hospital (Eq. 32). Records
+   held by other hospitals need their own active DelTok for (H_j, H_B), which
+   PolicyMatch (Eq. 74) checks.
+3. **Record-level filtering vocabulary.** Scope and purpose map to permitted
+   record classes through a public consortium vocabulary (`SCOPE_CLASSES`,
+   `PURPOSE_CLASSES`). ScopeMatch also checks the policy's time window.
+4. **Source and destination policies.** P_A = hosp:H_j AND class:c for a
+   record of class c at hospital H_j. P_B = idAttr(DID_B) AND the
+   requester's role. One re-key state therefore serves every record of the
+   same (H_j, class) pair, as Phase 5 Step 1 allows.
+5. **Linkage flags are finalized synchronously.** New linkage entries are
+   anchored, and the patient's Merkle root updated, before T_auth is released
+   (Phase 4 Step 4). Existing entries are reused under the same context.
+   ComAuth (Eq. 65) and ComShare (Eq. 90) are queued and submitted off the
+   retrieval path (`flush_anchors`), and that cost is measured separately.
+6. **Chain state is read at every check.** ValidState (Eq. 70, 82, 86) and the
+   record and linkage verifications (Eq. 79–80, 88) each query the chaincode
+   rather than a local snapshot. This is the strictest reading of "latest
+   synchronized finalized state", and its cost appears in the measurements.
+7. **The edge TEE is not emulated.** Device AEAD, verification and aggregation
+   (Eq. 35–39) run as ordinary code on the measurement machine.
+8. **Fabric deployment.** The test-network has two organizations with one peer
+   each, LevelDB state databases and BatchTimeout 1 s. RBPRE-CALX uses its own
+   channel `rbpre`. The paper's statement of one peer and one CouchDB per
+   hospital must be made to match whatever deployment the final run uses.
+
 ## Process layout
 
 - One Python process runs the protocol roles. Every external service is real

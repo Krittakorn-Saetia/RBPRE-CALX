@@ -208,6 +208,8 @@ class CPABPRE:
                 return {k: enc(v) for k, v in o.items()}
             if isinstance(o, (list, tuple)):
                 return [enc(v) for v in o]
+            if isinstance(o, (bytes, bytearray)):
+                return {"__b": bytes(o).hex()}
             if isinstance(o, (str, int)) and not isinstance(o, bool):
                 return o
             return {"__e": self.group.serialize(o).decode("ascii")}
@@ -219,6 +221,8 @@ class CPABPRE:
             if isinstance(o, dict):
                 if set(o) == {"__e"}:
                     return self.group.deserialize(o["__e"].encode("ascii"))
+                if set(o) == {"__b"}:
+                    return bytes.fromhex(o["__b"])
                 return {k: dec(v) for k, v in o.items()}
             if isinstance(o, list):
                 return [dec(v) for v in o]

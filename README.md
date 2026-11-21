@@ -13,10 +13,11 @@ et al., and blockchain-anchored record and linkage commitments.
 **Status: under construction.** Done so far:
 - the crypto core
 - the Groth16 authorization circuits
+- the Fabric chaincode
 - the Neo4j, MinIO and Redis clients
+- Phases 1–5 end to end, tested on the Fabric test-network
 
-Still to come: the Fabric chaincode, the five protocol phases, the compared
-schemes and the experiment drivers.
+Still to come: the compared schemes and the experiment drivers.
 
 - [DESIGN.md](DESIGN.md): how each part of the construction is implemented,
   and every choice the paper leaves open.
@@ -32,6 +33,10 @@ schemes and the experiment drivers.
 | `rbpre/aead.py`, `rbpre/sig.py`, `rbpre/merkle.py` | AES-256-GCM, Ed25519, patient Merkle tree |
 | `rbpre/zk.py` | client for the `zk/rbzk` helper |
 | `rbpre/graph.py`, `rbpre/storage.py`, `rbpre/cache.py` | Neo4j retrieval graph, MinIO EHR store, Redis nonces/sessions/re-key cache |
+| `rbpre/chain.py` | Fabric client (peer CLI, submit to commit) and an in-memory mirror for offline tests |
+| `rbpre/protocol.py` | Phases 1–5, one method per paper step, with per-step timers |
+| `chaincode/` | Go chaincode (DID, credential, consent/CMC, delegation, epoch, record, linkage, anchors) and its ccaas deploy script |
+| `smoke_protocol.py` | one end-to-end run with a per-step latency breakdown |
 | `zk/` | Go helper: gnark Groth16 on BLS12-381 (holder-bound and original R_auth), Jubjub EdDSA, MiMC |
 | `infra/` | Python environment, Docker Compose services, MinIO build |
 | `tests/` | unit and integration tests |
@@ -43,6 +48,14 @@ infra/setup_venv.sh                       # Python venv in ~/.venvs/rbpre-calx (
 (cd zk && go build -o rbzk .)             # Go 1.22+
 infra/build_minio.sh                      # MinIO from the official source, once
 infra/services.sh up                      # Neo4j, Redis, MinIO on 127.0.0.1
+infra/fabric.sh up                        # Fabric test-network + channel rbpre
+chaincode/deploy_ccaas.sh                 # deploy the chaincode, once
 ~/.venvs/rbpre-calx/bin/python -m unittest discover -s tests -t . -v
+RBPRE_FABRIC=1 ~/.venvs/rbpre-calx/bin/python -m unittest tests.test_protocol -v
 (cd zk && go test ./...)
+~/.venvs/rbpre-calx/bin/python smoke_protocol.py
 ```
+
+The Fabric test-network comes from a FLEX-DIAM V3 machine setup
+(`~/flex-diam/fabric-samples`, Fabric 2.5.9, BatchTimeout 1 s); set
+`FLEX_INFRA` if it is elsewhere.
