@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -52,13 +53,15 @@ class ZK:
             raise ZKError(f"{binary} not found; build it with: cd zk && go build -o rbzk .")
         self._p = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    text=True, bufsize=1)
+        self._lock = threading.Lock()  # one request in flight per rbzk process
 
     def call(self, **req) -> dict:
-        t0 = time.perf_counter()
-        self._p.stdin.write(json.dumps(req, separators=(",", ":")) + "\n")
-        self._p.stdin.flush()
-        line = self._p.stdout.readline()
-        rtt = (time.perf_counter() - t0) * 1e3
+        with self._lock:
+            t0 = time.perf_counter()
+            self._p.stdin.write(json.dumps(req, separators=(",", ":")) + "\n")
+            self._p.stdin.flush()
+            line = self._p.stdout.readline()
+            rtt = (time.perf_counter() - t0) * 1e3
         if not line:
             raise ZKError("rbzk exited")
         resp = json.loads(line)

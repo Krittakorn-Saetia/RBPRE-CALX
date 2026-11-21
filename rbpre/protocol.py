@@ -159,6 +159,19 @@ class Record:
 
 
 @dataclass
+class Challenge:
+    """Gateway challenge state for one authorization (Eq. 50-51)."""
+
+    purpose: str
+    scope: str
+    e: int
+    pid_star: bytes
+    n_g: bytes
+    t_g: int
+    pub: dict  # public statement x (Eq. 53), including h_ctx
+
+
+@dataclass
 class Session:
     doctor: Doctor
     patient: Patient
@@ -361,29 +374,36 @@ class RBPRESystem:
     # ================================================================ Phase 3
 
     def authorize(self, doc: Doctor, p: Patient, purpose: str, scope: str, t: Timer = _NULL) -> Session:
-        """Phase 3: challenge (Eq. 50-52), proof (Eq. 53-56), consent, delegation
-        and proof verification (Eq. 57-62), AuthTok (Eq. 63-65), session and
-        descriptor (Eq. 66-68)."""
+        """Phase 3 end to end: challenge, holder proof, gateway verification."""
+        ch = self.gw_challenge(doc, p, purpose, scope, t)
+        proof = self.doc_prove(doc, p, ch, t)
+        return self.gw_authorize(doc, p, ch, proof, t)
+
+    def gw_challenge(self, doc: Doctor, p: Patient, purpose: str, scope: str, t: Timer = _NULL,
+                     t_g: int | None = None) -> Challenge:
+        """Step 1: Req (Eq. 50), pk_D from the DID registry, h_A, n_G, t_G and
+        h_ctx (Eq. 51). t_g overrides the issuance time (freshness tests only)."""
         e, pid_star = p.e, p.pid_star()
-        # ---- Step 1: request and challenge
         with t.step("p3.gw_challenge"):
-            req = (doc.did, doc.cid, pid_star, purpose, scope, e)                           # Eq. 50
             st, _, _ = self.ledger.get_state({"did": [doc.did]})
             if st["did"].get(doc.did, {}).get("pk") != doc.zk_pk:
                 raise Rejected("pk_D not bound to DID_D")
             pk_d = st["did"][doc.did]["pk"]
             h_a = self.policy_digest(self.cs_policies[p.pid])
-            n_g, t_g = os.urandom(32), now()
+            n_g, t_g = os.urandom(32), (now() if t_g is None else t_g)
             self.cache.issue_nonce(n_g, t_g, AUTH_LIFETIME_S)
             pub = dict(did=fe(doc.did), cid=fe(doc.cid), pid=fe(pid_star), purpose=fe("purpose:" + purpose),
                        scope=fe("scope:" + scope), epoch=e, tg=t_g, ng=fe(n_g), ha=h_a, cb=fe(doc.cb),
                        pk_ci=self.ci_pk, pk_d=pk_d)
-            h_ctx = self.zk.mimc(pub["did"], pub["cid"], pub["pid"], pub["purpose"], pub["scope"],
-                                 fe(e), h_a, fe(t_g), pub["ng"], pub["cb"])                 # Eq. 51
-            pub["hctx"] = h_ctx
-        # ---- Step 1-2: holder signature and proof (doctor's device)
+            pub["hctx"] = self.zk.mimc(pub["did"], pub["cid"], pub["pid"], pub["purpose"], pub["scope"],
+                                       fe(e), h_a, fe(t_g), pub["ng"], pub["cb"])           # Eq. 51
+        return Challenge(purpose, scope, e, pid_star, n_g, t_g, pub)
+
+    def doc_prove(self, doc: Doctor, p: Patient, ch: Challenge, t: Timer = _NULL) -> str:
+        """Steps 1-2 on the doctor's device: sigma_D = Sign_skD(h_ctx) (Eq. 52)
+        and pi <- ZK.Prove(pp_ZK, x, w) (Eq. 53-56)."""
         with t.step("p3.doc_sign"):
-            sig_d = self.zk.sign(doc.zk_sk, h_ctx)                                         # Eq. 52
+            sig_d = self.zk.sign(doc.zk_sk, ch.pub["hctx"])                                # Eq. 52
         policy = self.cs_policies[p.pid]
         slots = [fe(a) for a in doc.attrs] + [fe(0)] * (self.m - len(doc.attrs))
         wit = dict(attr=slots, tvc=doc.t_vc, vc=doc.vc, req=policy.slots(self.m),
@@ -391,9 +411,18 @@ class RBPRESystem:
                    tstart=policy.t_start, tend=policy.t_end, sig_d=sig_d)
         with t.step("p3.doc_prove"):
             try:
-                proof = self.zk.prove("holder", self.m, pub, wit)["proof"]                 # Eq. 56
+                return self.zk.prove("holder", self.m, ch.pub, wit)["proof"]               # Eq. 56
             except Exception as ex:  # the doctor cannot produce a proof
                 raise Rejected(f"no proof: {ex}") from ex
+
+    def gw_authorize(self, doc: Doctor, p: Patient, ch: Challenge, proof: str,
+                     t: Timer = _NULL) -> Session:
+        """Steps 3-5: consent attestation (Eq. 57-60), Fresh and the checks of
+        Eq. 62, atomic consumption of n_G, AuthTok (Eq. 63-65), session (Eq. 66)
+        and descriptor chi (Eq. 67-68)."""
+        purpose, scope, e, pid_star, n_g, t_g = ch.purpose, ch.scope, ch.e, ch.pid_star, ch.n_g, ch.t_g
+        pub, h_ctx = ch.pub, ch.pub["hctx"]
+        policy = self.cs_policies[p.pid]
         # ---- Step 3: consent service
         with t.step("p3.cs_consent"):
             sigma_c, open_c = self.cs_attest(p, purpose, scope)                            # Eq. 57-60
@@ -402,7 +431,7 @@ class RBPRESystem:
             t_now = now()
             issued = self.cache.peek_nonce(n_g)
             if issued is None or issued != t_g or not 0 <= t_now - t_g <= AUTH_LIFETIME_S:
-                raise Rejected("stale or unknown challenge")
+                raise Rejected("stale, unknown or already used challenge")
         src = p.home
         dele = self.delegations.get((src, doc.domain, pid_star))
         if dele is None:
