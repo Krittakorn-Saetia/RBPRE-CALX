@@ -21,8 +21,9 @@ chaincode/rbpre/rbpre
 /exp*.csv
 /fig/
 *.log
-# development runs on the build machine are not results
+# development and dry runs on the build machine are not results
 results/dev/
+results/dryrun*/
 
 # OS / editor
 desktop.ini
