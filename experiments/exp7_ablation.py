@@ -17,6 +17,11 @@ of five variants is measured:
 Variants (iii) and (iv) are performance-only controls: they transform records
 that are not authorized. The per-stage times are kept for stacked bars.
 
+Top-up runs (RBPRE_TOPUP set, see harness): --measure-ratios builds every
+patient of --ratios exactly as the original run did but measures only at
+the listed ratios, and --variants (indices 0-4 into the list above) limits
+the measured variants.
+
     python -m experiments.exp7_ablation [--n 10000] [--ratios ...] [--runs 30]
 """
 
@@ -52,6 +57,8 @@ def main() -> None:
     ap.add_argument("--hospitals", type=int, default=5)
     ap.add_argument("--runs", type=int, default=30)
     ap.add_argument("--m", type=int, default=10)
+    ap.add_argument("--measure-ratios", type=float, nargs="*", help="measure only at these ratios")
+    ap.add_argument("--variants", type=int, nargs="*", help="measure only these variants (0 = full ... 4 = (iv))")
     args = ap.parse_args()
     save_machine()
     ledger, graph, store, cache = services(True, bucket="ehr-exp7")
@@ -61,6 +68,9 @@ def main() -> None:
     for ratio in args.ratios:
         target = w.new_target()
         w.grow(target, args.n, ratio)
+        print(f"ratio={ratio:<5} built, |T_auth|={len(target.authorized)}")
+        if args.measure_ratios and not any(abs(ratio - x) < 1e-9 for x in args.measure_ratios):
+            continue
         p = target.patient
         sess = s.authorize(doc, p, "treatment", "cardiology")
         ref = s.discover(sess)                      # warm-up: linkage entries
@@ -98,6 +108,8 @@ def main() -> None:
 
         variants = [("full", full), ("(i) no reuse", no_reuse), ("(ii) no early filter", no_filter),
                     ("(iii) no selective PRE", no_selective), ("(iv) no filter + no selective", neither)]
+        if args.variants:
+            variants = [v for i, v in enumerate(variants) if i in args.variants]
         for name, fn in variants:  # warm-up, not recorded
             sess = fresh_session()
             fn(Timer())

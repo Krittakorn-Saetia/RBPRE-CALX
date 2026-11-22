@@ -3,6 +3,12 @@ machine description and service construction.
 
 Every driver writes raw per-run CSV rows to results/<run>/ (RBPRE_RUN, default
 "dev"); plots are generated from those files only.
+
+Top-up runs: with RBPRE_TOPUP=<label>, a driver adds its rows to the rows
+already in each result file instead of replacing them. Every row carries a
+`batch` column (0 for the original runs, <label> for the added ones), so the
+plots and summaries average over all batches. Before a file is first
+extended, a copy is kept as results/<run>/batches/<file>.before-<label>.csv.
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ import gc
 import json
 import os
 import platform
+import shutil
 import statistics
 import subprocess
 import time
@@ -22,6 +29,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 RUN = os.environ.get("RBPRE_RUN", "dev")
 OUT = ROOT / "results" / RUN
+TOPUP = os.environ.get("RBPRE_TOPUP", "")
+_base: dict[str, list[dict]] = {}
 
 
 def out_path(name: str) -> Path:
@@ -29,10 +38,39 @@ def out_path(name: str) -> Path:
     return OUT / name
 
 
+def selected(only: list[str] | None, *fields) -> bool:
+    """True if `fields` match one of the colon-separated tokens in `only`
+    (None or empty = everything). A token field "*" or a missing trailing field
+    matches anything; other fields must be equal as strings. Example:
+    selected(["e2:[25]:all:10000"], "e2", "[25]", "all", 10000)."""
+    if not only:
+        return True
+    for tok in only:
+        parts = tok.split(":")
+        if all(i >= len(parts) or parts[i] == "*" or parts[i] == str(f) for i, f in enumerate(fields)):
+            return True
+    return False
+
+
 def write_rows(name: str, rows: list[dict]) -> Path:
     path = out_path(name)
     if not rows:
         return path
+    if TOPUP:
+        if name not in _base:
+            old: list[dict] = []
+            if path.exists():
+                with path.open(newline="") as f:
+                    old = list(csv.DictReader(f))
+                keep = OUT / "batches" / f"{path.stem}.before-{TOPUP}{path.suffix}"
+                keep.parent.mkdir(exist_ok=True)
+                if not keep.exists():
+                    shutil.copyfile(path, keep)
+            for r in old:
+                if not r.get("batch"):
+                    r["batch"] = "0"
+            _base[name] = old
+        rows = _base[name] + [dict(r, batch=TOPUP) for r in rows]
     fields = list(dict.fromkeys(k for r in rows for k in r))
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -91,7 +129,7 @@ def machine() -> dict:
 
 
 def save_machine() -> None:
-    out_path("machine.json").write_text(json.dumps(machine(), indent=2))
+    out_path(f"machine.{TOPUP}.json" if TOPUP else "machine.json").write_text(json.dumps(machine(), indent=2))
 
 
 CHAIN = os.environ.get("RBPRE_CHAIN", "gateway")  # gateway | cli

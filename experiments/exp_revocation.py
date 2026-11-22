@@ -14,14 +14,21 @@ cached re-key states), every run measures four events:
 
 For the policy update it also measures the first retrieval after the event
 (new proof, new linkage entries for the new epoch, re-key cache misses)
-against a steady-state retrieval before it. It checks that all records,
-including those of earlier epochs, are still retrieved, so no stored record
-is re-pseudonymized. Each Fabric write waits for commit, so the event times
+against a steady-state retrieval before it. The steady-state retrieval is a
+repeated request in a live session, measured after one untimed retrieval
+under the current epoch, so its linkage entries already exist. It checks
+that all records, including those of earlier epochs, are still retrieved, so
+no stored record is re-pseudonymized. Each Fabric write waits for commit, so the event times
 include finalization.
 
 Compared schemes: [27] re-encrypts every affected ciphertext under the new
 policy (T_P + (m+1) T_E + m T_M per record), [31] performs one state update
 with consensus, and [25] blacklists at its authority (T_H).
+
+Top-up runs (RBPRE_TOPUP set, see harness): --only limits the measured
+points to tokens RBPRE-CALX:n:S (one run measures every RBPRE-CALX event at
+that point) and <scheme>:n for the compared schemes, e.g. "[25]:1000". The
+patient history still grows through every --n.
 
     python -m experiments.exp_revocation [--n 1000 5000 10000] [--sessions 1 10 50] [--runs 10]
 """
@@ -34,7 +41,7 @@ import gc
 from baselines.common import Prims
 from baselines.schemes import Luo31, Wang25, Yan27
 from experiments.exp234_retrieval import Series
-from experiments.harness import save_machine, services, write_rows
+from experiments.harness import save_machine, selected, services, write_rows
 from experiments.workload import World
 from rbpre.protocol import Timer
 
@@ -47,6 +54,7 @@ def main() -> None:
     ap.add_argument("--ratio", type=float, default=0.10)
     ap.add_argument("--runs", type=int, default=10)
     ap.add_argument("--m", type=int, default=10)
+    ap.add_argument("--only", nargs="*", help="measure only these points: RBPRE-CALX:n:S or <scheme>:n")
     args = ap.parse_args()
     save_machine()
     ledger, graph, store, cache = services(True, bucket="ehr-rev")
@@ -65,8 +73,7 @@ def main() -> None:
 
     def redelegate(t: Timer | None = None):
         t = t or Timer()
-        for h in w.hosp:
-            s.issue_delegation(p, h, doc.domain, t)
+        s.issue_delegations(p, w.hosp, doc.domain, t)    # every hospital re-issues its DelTok at once
 
     for n in args.n:
         w.grow(target, n, args.ratio)
@@ -86,11 +93,17 @@ def main() -> None:
             return out
 
         for sess_n in args.sessions:
+            if not selected(args.only, "RBPRE-CALX", n, sess_n):
+                continue
             for r in range(args.runs):
                 gc.collect()
                 gc.disable()  # no collector pauses inside the timed events (re-enabled below)
                 # ---- policy update, with steady-state and first retrieval around it
                 live = populate(doc, sess_n)
+                # Untimed retrieval first. The previous run ended with an epoch advance, so the
+                # first retrieval of this run would anchor the new epoch's linkage entries.
+                s.transform(live[0], s.discover(live[0]))
+                s.pending_anchors.clear()
                 t = Timer()
                 s.transform(live[-1], s.discover(live[-1], t), t)
                 record("steady-state retrieval", n, sess_n, r, t)
@@ -139,6 +152,8 @@ def main() -> None:
         ser = Series(args.runs, max(3, args.runs // 3), 60.0)
         pat = [e for e in w.index if e.owner == target.owner]
         for name, fn in (("[27]", lambda: y27.policy_update(pat)), ("[31]", l31.revoke), ("[25]", w25.revoke)):
+            if not selected(args.only, name, n):
+                continue
             for i, ms in enumerate(ser(fn)):
                 rows.append(dict(scheme=name, event="policy update / revocation", n=n, sessions="", run=i, ms=ms))
         write_rows("erev_runs.csv", rows)

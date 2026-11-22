@@ -122,19 +122,32 @@ def enc(scheme: CPABPRE, pp: dict, p_a: str) -> tuple[bytes, dict]:
     return scheme.encapsulate(pp, p_a)
 
 
-def reencrypt(scheme: CPABPRE, pp: dict, pk_kms: bytes, ct_a: dict, rk_state: dict,
-              chi: Descriptor) -> dict:
-    """CT_B <- ReEnc(PP, CT_A, RK_AB, chi) (Eq. 12-13)."""
+def check_state(scheme: CPABPRE, pk_kms: bytes, rk_state: dict, chi: Descriptor) -> None:
+    """The proxy's checks of an authenticated re-key state (Eq. 12): the KMS
+    signature over the rebuilt D_RK and H(chi) = h_chi. A proxy transforming many
+    records under one state checks it once."""
     if not sig.verify(pk_kms, rk_state["sigma_kms"], descriptor_bytes(scheme, rk_state)):
         raise RBError("KMS signature on the re-key descriptor is invalid")
     if chi.digest() != rk_state["h_chi"]:
         raise RBError("retrieval descriptor does not match the re-key state")
+
+
+def reencrypt_checked(scheme: CPABPRE, pp: dict, ct_a: dict, rk_state: dict) -> dict:
+    """ABPRE.ReEnc under a state that check_state accepted, after the per-record
+    source-policy check (Eq. 13)."""
     if ct_a.get("policy") != rk_state["p_a"]:
         raise RBError("ciphertext policy does not match the re-key source policy")
     try:
         return scheme.reencrypt(pp, rk_state["rk"], ct_a)
     except ABPREError as e:
         raise RBError(str(e)) from e
+
+
+def reencrypt(scheme: CPABPRE, pp: dict, pk_kms: bytes, ct_a: dict, rk_state: dict,
+              chi: Descriptor) -> dict:
+    """CT_B <- ReEnc(PP, CT_A, RK_AB, chi) (Eq. 12-13)."""
+    check_state(scheme, pk_kms, rk_state, chi)
+    return reencrypt_checked(scheme, pp, ct_a, rk_state)
 
 
 def dec(scheme: CPABPRE, pp: dict, sk_b: dict, ct_b: dict) -> bytes:

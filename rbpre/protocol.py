@@ -18,17 +18,28 @@ of the circuit.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from rbpre import aead, merkle, sig
 from rbpre import rbabpre as rb
 from rbpre.abpre import CPABPRE
-from rbpre.encoding import H, kdf
+from rbpre.encoding import H, encode, kdf
+from rbpre.policy import canon as policy_canon
 from rbpre.zk import ZK, fe
+
+
+def source_policy(hospital: str, rclass: str) -> str:
+    """P_A of a record of class c held by hospital H_j (protocol choice 4): the
+    single certified source-domain attribute src:<H_j>/<c>. One re-key state then
+    serves every record of the same (H_j, c), and re-encryption needs one leaf
+    pairing."""
+    return f"src:{hospital.split(':')[-1]}/{rclass}"
 
 # --------------------------------------------------------------- vocabulary
 # Public consortium vocabulary for record-level filtering (Eq. 74).
@@ -75,6 +86,18 @@ class Timer:
 
 
 _NULL = Timer()
+
+
+def together(*calls):
+    """Submit independent ledger writes at once and wait until every one is
+    committed (and applied to the mirror). Used only for writes that touch
+    disjoint state entries, so they are valid in the same block; results are
+    returned in order and the first failure is raised."""
+    if len(calls) == 1:
+        return [calls[0]()]
+    with ThreadPoolExecutor(len(calls)) as ex:
+        futs = [ex.submit(c) for c in calls]
+        return [f.result() for f in futs]
 
 
 def now() -> int:
@@ -244,7 +267,7 @@ class RBPRESystem:
 
     def add_hospital(self, name: str, t: Timer = _NULL) -> Hospital:
         did = f"did:rb:{name}"
-        attrs = [f"hosp:{name}"] + [f"class:{c}" for c in CLASSES]
+        attrs = [f"hosp:{name}"] + [source_policy(did, c) for c in CLASSES]
         h = Hospital(did, sig.keygen(), os.urandom(32), attrs)
         with t.step("p1.kms_source_keygen"):
             self.kms.keygen_source(did, h.key.pk, attrs)  # Eq. 22
@@ -293,6 +316,13 @@ class RBPRESystem:
         return p
 
     def _set_consent(self, p: Patient, policy: Policy, t_c: int, t: Timer, prev: bytes) -> None:
+        register = self._build_consent(p, policy, t_c, t, prev)
+        with t.step("p1.chain_consent"):
+            register()                                                               # Eq. 29
+
+    def _build_consent(self, p: Patient, policy: Policy, t_c: int, t: Timer, prev: bytes):
+        """Consent_P, ComC, Open_C for the patient's current epoch p.e (Eq. 24-28).
+        Returns the CMC registration of CRec_C (Eq. 29) as a call to submit."""
         pid_star = p.pid_star()
         with t.step("p1.consent_build"):
             h_a = self.policy_digest(policy)
@@ -303,9 +333,9 @@ class RBPRESystem:
                                          pk_p=p.key.pk, t_c=t_c, e=p.e, n_c=n_c)  # Eq. 28
             self.cs_pids.setdefault(p.pid, []).append(pid_star.hex())             # Eq. 24
             self.cs_policies[p.pid] = policy
-        with t.step("p1.chain_consent"):
-            self.ledger.register_consent(com_c.hex(), p.e, t_c, prev.hex())         # Eq. 29
         p.policy, p.com_c, p.t_c = policy, com_c, t_c
+        e = p.e
+        return lambda: self.ledger.register_consent(com_c.hex(), e, t_c, prev.hex())
 
     def policy_digest(self, policy: Policy) -> str:
         """h_A = H(A), computed with MiMC so that the circuit can recompute it."""
@@ -319,18 +349,29 @@ class RBPRESystem:
     def issue_delegation(self, p: Patient, source: str, target: str, t: Timer = _NULL,
                          t_del: int | None = None) -> None:
         """Step 5: ctx (Eq. 32), DelTok_ctx (Eq. 33), DRec_ctx (Eq. 34)."""
+        self.issue_delegations(p, [source], target, t, t_del)
+
+    def issue_delegations(self, p: Patient, sources: list[str], target: str, t: Timer = _NULL,
+                          t_del: int | None = None) -> None:
+        """Step 5 for several source hospitals at once. Each hospital signs its
+        own DelTok; their DRec registrations are independent state entries and
+        are submitted together, as separate hospitals would."""
         pol = p.policy
         t_del = t_del or now() + 180 * 86400
         pid_star = p.pid_star()
+        recs = {}
         with t.step("p1.deltok"):
-            ctx = self.ctx_of(source, target, pol.scope, pol.purpose, p.e)
-            n_del = os.urandom(16)
-            msg = H(pid_star, ctx, p.com_c, p.e, t_del, n_del)
-            tok = self.hospitals[source].key.sign(msg)
+            for source in sources:
+                ctx = self.ctx_of(source, target, pol.scope, pol.purpose, p.e)
+                n_del = os.urandom(16)
+                msg = H(pid_star, ctx, p.com_c, p.e, t_del, n_del)
+                tok = self.hospitals[source].key.sign(msg)
+                recs[(source, target, pid_star)] = dict(ctx=ctx, tok=tok, msg=msg, h=H(tok).hex(), e=p.e,
+                                                        t_del=t_del)
+        e = p.e
         with t.step("p1.chain_delegation"):
-            self.ledger.register_delegation(H(tok).hex(), p.e, t_del)
-        self.delegations[(source, target, pid_star)] = dict(
-            ctx=ctx, tok=tok, msg=msg, h=H(tok).hex(), e=p.e, t_del=t_del)
+            together(*[(lambda h=d["h"]: self.ledger.register_delegation(h, e, t_del)) for d in recs.values()])
+        self.delegations.update(recs)
 
     # ================================================================ Phase 2
 
@@ -355,12 +396,13 @@ class RBPRESystem:
                 meta = dict(pid=pid_star.hex(), type=rec.rtype, hosp=rec.hospital, t_r=rec.t_r,
                             cls=rec.rclass)                                              # Eq. 38
                 r_m = os.urandom(32)
-                phi = H(json.dumps(meta, sort_keys=True), r_m)                            # Eq. 39
+                meta_c = json.dumps(meta, sort_keys=True)                                # canonical encoding
+                phi = H(meta_c, r_m)                                                      # Eq. 39
             with t.step("p2.ehr_encrypt"):
                 n_r = os.urandom(16)
                 rid = H(pid_star, phi, e, n_r)
                 rid_star = H(rid, e)                                                      # Eq. 40
-                p_a = f"hosp:{rec.hospital.split(':')[-1]} AND class:{rec.rclass}"
+                p_a = source_policy(rec.hospital, rec.rclass)
                 k_aes, ct_k = rb.enc(self.scheme, self.kms.pp, p_a)                       # Eq. 43
                 ad = H(pid_star, rid_star, phi, bytes.fromhex(h_a), p.com_c, e)           # Eq. 41
                 ct_m = aead.encrypt(k_aes, m_agg, ad)                                     # Eq. 42
@@ -371,8 +413,9 @@ class RBPRESystem:
             rows.append(dict(rid=rid_star.hex(), pid=pid_star.hex(), phi=phi.hex(), ha=h_a,
                              hosp=rec.hospital))
             coms.append({"id": rid_star.hex(), "v": com_r.hex()})
-            opens.append((rid_star.hex(), dict(meta=meta, r_m=r_m, h_a=h_a, com_c=p.com_c, e=e,
-                                               phi=phi)))
+            # the consent service keeps phi's canonical preimage with the opening
+            opens.append((rid_star.hex(), dict(meta=meta, pre=encode(meta_c, r_m), r_m=r_m, h_a=h_a,
+                                               com_c=p.com_c, e=e, phi=phi)))
         with t.step("p2.store"):
             uris = self.store.put_many(packages)                                          # Eq. 44
         for row, uri in zip(rows, uris):
@@ -548,17 +591,41 @@ class RBPRESystem:
             t_d = self.graph.candidates(p_pid)                                         # Eq. 71
         pol = self.cs_policies[p.pid]
         with t.step("p4.filter"):
-            checked = []
+            # Authorized() (Eq. 74) per record: the class and time-window conditions of
+            # ScopeMatch and PurposePermit are resolved once per request, and PolicyMatch
+            # (the source domain's delegation) once per hospital; same decision as
+            # authorized(). T_F keeps a record only if its opening verifies (Eq. 73)
+            # and it is authorized, so with early filtering the opening is verified
+            # for the authorized records only: the same T_F, without hashing records
+            # that are excluded anyway. Without early filtering (the ablation) every
+            # candidate's opening is verified first.
+            p_pids = set(p_pid)
+            classes = (SCOPE_CLASSES.get(s.chi.scope, set()) & PURPOSE_CLASSES.get(s.chi.purpose, set())
+                       if s.chi.purpose == pol.purpose else set())
+            t_lo, t_hi = pol.t_start, pol.t_end
+            opens, sha256 = self.cs_open_r, hashlib.sha256
+            delegated: dict[str, bool] = {}
+            checked, t_f = [], []
             for c in t_d:
-                op = self.cs_open_r.get(c["rid"])                                      # Eq. 72
-                if op is None or H(json.dumps(op["meta"], sort_keys=True), op["r_m"]).hex() != c["phi"]:
-                    continue                                                           # Eq. 73
-                if op["meta"]["pid"] not in p_pid or op["meta"]["hosp"] != c["hosp"]:
+                op = opens.get(c["rid"])                                               # Eq. 72
+                if op is None:
                     continue
-                c["open"] = op
-                c["auth"] = self.authorized(doc, op["meta"], s, pol)                    # Eq. 74
+                meta = op["meta"]
+                hosp = meta["hosp"]
+                if meta["pid"] not in p_pids or hosp != c["hosp"]:
+                    continue
+                ok = delegated.get(hosp)
+                if ok is None:
+                    ok = delegated[hosp] = self.policy_match(doc, meta, s)
+                auth = ok and meta["cls"] in classes and t_lo <= meta["t_r"] <= t_hi
+                if (auth or not early_filter) and sha256(op["pre"]).hexdigest() != c["phi"]:  # Eq. 73
+                    continue
+                c["open"], c["auth"] = op, auth
                 checked.append(c)
-            t_f = [c for c in checked if c["auth"]] if early_filter else checked       # Eq. 75
+                if auth:
+                    t_f.append(c)
+            if not early_filter:
+                t_f = checked                                                          # Eq. 75
         self.last_candidates = checked  # for the ablation variants that skip selection
         # ---- Step 4: linkage identifiers (Eq. 76-77)
         with t.step("p4.linkage_prepare"):
@@ -598,9 +665,9 @@ class RBPRESystem:
                 for f in new_flags:
                     tree.leaves.append(f)
                 tree._build()
-            with t.step("p4.chain_linkage"):
-                self.ledger.anchor_flags([{"id": f.hex(), "e": s.chi.e} for f in new_flags])
-                self.ledger.set_root(pid_hex, tree.root.hex())
+            with t.step("p4.chain_linkage"):   # flags and root are separate state entries: one block
+                flags, root_hex = [{"id": f.hex(), "e": s.chi.e} for f in new_flags], tree.root.hex()
+                together(lambda: self.ledger.anchor_flags(flags), lambda: self.ledger.set_root(pid_hex, root_hex))
         tree = self.trees.get(pid_hex)
         with t.step("p4.chain_linkage_state"):
             st = self.state({"flag": [c["flag"].hex() for c in ok], "root": [pid_hex]})
@@ -644,26 +711,22 @@ class RBPRESystem:
         every candidate key capsule (all_candidates)."""
         doc, p = s.doctor, s.patient
         targets = t_auth if selective else (all_candidates or t_auth)
-        missing = [c for c in targets if "ct" not in c]
-        if missing:  # candidates that discovery did not fetch (non-selective variant)
-            with t.step("p5.fetch_candidates"):
-                for c, blob in zip(missing, self.store.get_many([c["uri"] for c in missing])):
-                    c["ct"] = blob
         self.valid_state(s, t, "p5.kms_state")                                         # Eq. 82
         h_chi = s.chi.digest()
         p_b = f"{rb.id_attr(doc.did)} AND {doc.attrs[0]}"
         with t.step("p5.gw_sign_set"):
             h_set = H(*sorted(c["rid"] for c in targets))
             sigma_t = self.gw_key.sign(H(h_chi, doc.pk_bytes, h_set))                  # Eq. 85
-        # ---- re-key states per (source domain, policy) (Eq. 83-84, 94-95)
+        # ---- re-key states per (source domain, policy) (Eq. 83-84, 94-95); the KMS
+        # resolves each record's source policy from its verified metadata
+        with t.step("p5.kms_resolve"):
+            for c in targets:
+                meta = c["open"]["meta"]
+                c["p_a"] = policy_canon(source_policy(meta["hosp"], meta["cls"]))
+            keys = list(dict.fromkeys((c["hosp"], c["p_a"]) for c in targets))
         states = {}
-        for c in targets:
-            ct_k = self.scheme.loads(c["ct"][1])
-            c["ct_k"] = ct_k
-            key = (c["hosp"], ct_k["policy"])
-            if key in states:
-                continue
-            kappa = H(h_chi, doc.pk_bytes, c["hosp"], H(ct_k["policy"]), H(p_b))        # Eq. 94
+        for hosp, p_a in keys:
+            kappa = H(h_chi, doc.pk_bytes, hosp, H(p_a), H(p_b))                          # Eq. 94
             rk = None
             if use_cache:
                 with t.step("p5.rk_cache_get"):
@@ -671,7 +734,7 @@ class RBPRESystem:
                     rk = self.scheme.loads(blob) if blob else None
             if rk is None:
                 with t.step("p5.kms_rekeygen"):
-                    rk = self.kms.rekeygen(c["hosp"], ct_k["policy"], p_b, doc.pk_bytes, s.chi)
+                    rk = self.kms.rekeygen(hosp, p_a, p_b, doc.pk_bytes, s.chi)
                 if use_cache:
                     with t.step("p5.rk_cache_put"):
                         self.cache.put_rekey(kappa, self.scheme.dumps(rk), s.t_sess - now(),
@@ -679,12 +742,15 @@ class RBPRESystem:
                 t.add("p5.rk_miss", 0.0)
             else:
                 t.add("p5.rk_hit", 0.0)
-            states[key] = rk
+            states[(hosp, p_a)] = rk
         # ---- proxy (Eq. 86-89)
         self.valid_state(s, t, "p5.proxy_state")                                      # Eq. 86
         with t.step("p5.proxy_check_set"):
             if not sig.verify(self.gw_key.pk, sigma_t, H(h_chi, doc.pk_bytes, h_set)):
                 raise Rejected("retrieval-set signature invalid")
+        with t.step("p5.proxy_check_states"):   # each authenticated re-key state once (Eq. 12)
+            for rk in states.values():
+                rb.check_state(self.scheme, self.kms.pk_kms, rk, s.chi)
         with t.step("p5.proxy_fetch"):
             blobs = self.store.get_many([c["uri"] for c in targets])
         with t.step("p5.proxy_chain"):
@@ -697,9 +763,10 @@ class RBPRESystem:
                                                 H(ct_m, ct_k_b)).hex():                # Eq. 87-88
                     raise Rejected("ciphertext-record binding failed")
             with t.step("p5.proxy_reenc"):
-                ct_kb = rb.reencrypt(self.scheme, self.kms.pp, self.kms.pk_kms, c["ct_k"],
-                                     states[(c["hosp"], c["ct_k"]["policy"])], s.chi)  # Eq. 89
-            out.append(dict(c, ct_kb=ct_kb, ct_m=ct_m))
+                ct_k = self.scheme.loads(ct_k_b)          # the proxy's own, binding-checked copy
+                ct_kb = rb.reencrypt_checked(self.scheme, self.kms.pp, ct_k,
+                                             states[(c["hosp"], c["p_a"])])             # Eq. 89
+            out.append(dict(c, ct_k=ct_k, ct_kb=ct_kb, ct_m=ct_m))
         # ---- sharing commitments, asynchronous (Eq. 90)
         with t.step("p5.share_commit"):
             shares = [H(s.pid_star, c["rid"], c["hosp"], doc.domain, h_chi, s.chi.e).hex() for c in out]
@@ -740,12 +807,21 @@ class RBPRESystem:
 
     # ======================================================== Phase 5 Step 5
 
-    def _advance(self, p: Patient, rev: dict, t: Timer) -> int:
-        """Advance the patient's epoch and finalize ComRev_{e+1} (Eq. 96-97),
-        then invalidate affected sessions and re-key states."""
-        with t.step("rev.chain_epoch"):
+    # A revocation event's ledger writes (the lifecycle status or the new consent
+    # state, and the epoch advance with ComRev_{e+1}) touch separate state entries,
+    # so they are submitted together and finalize in one block. The event is
+    # complete when all of them are committed and applied to the mirror.
+
+    def _advance(self, p: Patient, rev: dict, t: Timer, *writes) -> int:
+        """Advance the patient's epoch and finalize ComRev_{e+1} (Eq. 96-97)
+        together with `writes`, then invalidate affected sessions and re-key states."""
+        e_next = p.e + 1
+        with t.step("rev.chain"):
             com_rev = H(json.dumps(rev, sort_keys=True)).hex()
-            p.e, _ = self.ledger.advance_epoch(p.handle, com_rev)
+            res = together(lambda: self.ledger.advance_epoch(p.handle, com_rev), *writes)
+        if res[0][0] != e_next:
+            raise RuntimeError(f"epoch advanced to {res[0][0]}, expected {e_next}")
+        p.e = e_next
         with t.step("rev.cache_invalidate"):
             removed = self.cache.invalidate(p.handle)
         t.add("rev.entries_invalidated", 0.0, removed)
@@ -753,16 +829,18 @@ class RBPRESystem:
 
     def withdraw_consent(self, p: Patient, t: Timer = _NULL) -> None:
         """Consent withdrawal revokes CRec_C (Phase 5 Step 5)."""
-        with t.step("rev.chain_consent"):
-            self.ledger.set_status("cons", p.com_c.hex(), "revoked")
-        self._advance(p, {"e": p.e + 1, "rev_consent": p.com_c.hex()}, t)
+        com_c = p.com_c.hex()
+        self._advance(p, {"e": p.e + 1, "rev_consent": com_c}, t,
+                      lambda: self.ledger.set_status("cons", com_c, "revoked"))
 
     def update_policy(self, p: Patient, policy: Policy, t: Timer = _NULL) -> None:
         """Policy update: new epoch, new pseudonym PID*_{e+1} and ComC^{e+1}
         (Eq. 98), superseding the previous consent state."""
-        old = p.com_c
-        self._advance(p, {"e": p.e + 1, "superseded": old.hex()}, t)
-        self._set_consent(p, policy, p.t_c, t, prev=old)
+        old, e = p.com_c, p.e
+        p.e = e + 1                       # the consent state is built for the new epoch
+        register = self._build_consent(p, policy, p.t_c, t, prev=old)
+        p.e = e
+        self._advance(p, {"e": e + 1, "superseded": old.hex()}, t, register)
 
     def revoke_credential(self, doc: Doctor, t: Timer = _NULL) -> int:
         """Credential revocation: CRec_D -> revoked, and the doctor's sessions
@@ -776,6 +854,5 @@ class RBPRESystem:
 
     def revoke_delegation(self, p: Patient, source: str, target: str, t: Timer = _NULL) -> None:
         d = self.delegations[(source, target, p.pid_star())]
-        with t.step("rev.chain_del"):
-            self.ledger.set_status("del", d["h"], "revoked")
-        self._advance(p, {"e": p.e + 1, "rev_del": d["h"]}, t)
+        self._advance(p, {"e": p.e + 1, "rev_del": d["h"]}, t,
+                      lambda: self.ledger.set_status("del", d["h"], "revoked"))

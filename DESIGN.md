@@ -124,10 +124,14 @@ Points that the paper's text leaves open, and how the prototype fixes them:
 3. **Record-level filtering vocabulary.** Scope and purpose map to permitted
    record classes through a public consortium vocabulary (`SCOPE_CLASSES`,
    `PURPOSE_CLASSES`). ScopeMatch also checks the policy's time window.
-4. **Source and destination policies.** P_A = hosp:H_j AND class:c for a
-   record of class c at hospital H_j. P_B = idAttr(DID_B) AND the
-   requester's role. One re-key state therefore serves every record of the
-   same (H_j, class) pair, as Phase 5 Step 1 allows.
+4. **Source and destination policies.** P_A is the single certified
+   source-domain attribute src:H_j/c for a record of class c at hospital H_j;
+   each hospital's source key holds one such attribute per class. P_B =
+   idAttr(DID_B) AND the requester's role. One re-key state therefore serves
+   every record of the same (H_j, class) pair, as Phase 5 Step 1 allows, and
+   ReEnc needs one leaf pairing (three pairings per record in all). The KMS
+   resolves P_A from the record's verified metadata; the proxy checks it
+   against the policy carried in the ciphertext it read itself.
 5. **Linkage flags are finalized synchronously.** New linkage entries are
    anchored, and the patient's Merkle root updated, before T_auth is released
    (Phase 4 Step 4). Existing entries are reused under the same context.
@@ -150,6 +154,20 @@ Points that the paper's text leaves open, and how the prototype fixes them:
    each, LevelDB state databases and BatchTimeout 1 s. RBPRE-CALX uses its own
    channel `rbpre`. The paper's statement of one peer and one CouchDB per
    hospital must be made to match whatever deployment the final run uses.
+9. **Query shape and per-request work.** Candidate discovery returns one row
+   per hospital holding that hospital's RID*, phi and URI lists; the compared
+   schemes' repository lookup uses the same shape. The consent service keeps
+   each metadata opening with phi's canonical preimage, so the gateway
+   re-hashes it without re-serializing it. The class and time-window
+   conditions of Authorized() are resolved once per request and PolicyMatch
+   once per hospital. A record enters T_F only if its opening verifies
+   (Eq. 73) and it is authorized (Eq. 74); with early filtering the gateway
+   evaluates the authorization conditions first and verifies the opening of
+   the authorized records only, which yields the same T_F (the ablation without
+   early filtering verifies every candidate's opening first). The paper's
+   Phase 4 text should state this order. The proxy checks each re-key state's KMS
+   signature and H(chi) once per transformation, and re-encrypts the
+   ciphertexts it fetched and binding-checked itself.
 
 ## Process layout
 
@@ -172,6 +190,7 @@ Points that the paper's text leaves open, and how the prototype fixes them:
 | Hyperledger Fabric | 2.5.9 |
 | Fabric Gateway client | `github.com/hyperledger/fabric-gateway` v1.5.1 (in `fabgw/`) |
 | Neo4j | 5.26.33 Community (Docker `neo4j:5.26-community`) |
+| Neo4j Python driver | 5.28.8 with `neo4j-rust-ext` 5.28.8.0 (used by RBPRE-CALX and the compared schemes) |
 | Redis | 7.4.12 (Docker `redis:7.4-alpine`) |
 | MinIO | RELEASE.2025-10-15T17-29-55Z, built from the official source by `infra/build_minio.sh` (MinIO no longer publishes official images) |
 | Docker Engine | 29.5.3 |

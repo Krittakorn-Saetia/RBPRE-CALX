@@ -19,6 +19,11 @@ $PY -m experiments.exp_revocation         # revocation and consent-update cost
 $PY -m experiments.plot                   # figures + summary tables (needs matplotlib)
 ```
 
+The figures follow the format of the manuscript's Figs. 2–8 (colours, markers,
+log axes, legend, and the bar layout of Fig. 8); `experiments/plot.py`
+describes it. Points are means with one-SD error bars, and every figure has a
+`summary_<name>.csv` with mean, SD and run count per point.
+
 Every driver has `--help`. `experiments/run_all.sh` runs them in order and is
 resumable. `PROFILE=full` runs every experiment with the defaults. `PROFILE=quick`
 runs the set the revision needs, with fewer points and runs:
@@ -38,6 +43,19 @@ runs the set the revision needs, with fewer points and runs:
 - **No collector pauses.** Every timed run is measured with Python's cyclic
   garbage collector paused (`harness.quiet`).
 - **Fixed workload.** The workload uses a fixed random seed.
+
+**Stability and top-up runs.**
+- `python -m experiments.stability --run <run>` lists every plotted point whose
+  95% confidence interval of the mean is wider than ±5% of the mean, or whose
+  mean breaks the rise of its curve, with the run count it needs (at most 30).
+  It writes `stability.csv`.
+- `python -m experiments.topup --run <run>` adds runs to exactly those points
+  and repeats the check (two rounds by default; `--dry` prints the plan). The
+  drivers then append to the existing files (`RBPRE_TOPUP`, see
+  `harness.py`). Each row's `batch` column says which batch produced it, and
+  means are taken over all batches. The workloads are rebuilt through the
+  original sweep with the same seed, so the added runs measure the same
+  records. A copy of each file before it was extended is kept in `batches/`.
 
 **Chain client.** All schemes use the same Fabric Gateway client (`fabgw`,
 `RBPRE_CHAIN=gateway`, the default). RBPRE-CALX's validity checks read the
@@ -62,26 +80,71 @@ switches every scheme to the peer CLI.
 
 ## Compared schemes
 
-`baselines/schemes.py` re-implements [25], [27] and [31] on the same primitives
-as RBPRE-CALX: the Charm-Crypto SS512 pairing group, NIST P-256, AES-256-GCM,
-SHA-256, Hess identity-based signatures, and the same Fabric network. Each one
-executes the cost-dominant operations of its own protocol, per request, record
-or event, as listed in the paper's computation cost comparison (Table IV).
+`baselines/schemes.py` re-implements [25], [27] and [31] with the operations
+each scheme's **own paper** specifies (checked against the papers in November
+2026). They run on the same
+libraries as RBPRE-CALX (Charm-Crypto, NIST P-256, AES-256-GCM, SHA-256, Hess
+identity-based signatures on SS512) and the same Fabric network; [27] runs on
+its own curve, MNT159.
 
-| | [25] | [27] | [31] |
+| | [25] (TNSE 2026, Table V) | [27] (IoT-J 2026, Table II, MNT159) | [31] (IoT-J 2025, Sec. V-B) |
 |---|---|---|---|
-| Authentication | T_sm + T_p + T_H + T_sym + T_add | T_P + m T_E + m T_M | T_IBS^sign + T_IBS^ver + T_H + T_B^qry |
-| Transformation, per record | n/a (symmetric re-wrap, as a reference) | T_P + t T_E + t T_M | T_IBS^ver + T_H, one T_B^qry per domain |
-| Verification, per record | n/a | T_P + T_H | T_IBS^ver + T_H, one T_B^qry per domain |
+| Authentication, requester | 2 T_sm + 8 T_h | ShareDecrypt: 1 P | nothing (the device computes no cryptography) |
+| Authentication, verifier | 1 T_sm + 10 T_h | ShareVerify: 2 P + (s+1) E + s M | 2 T_IBS^sign + 2 T_IBS^ver (request and response, both on the domains' servers); T_B^qry only for an unknown sender |
+| Retrieval, per record (stand-in) | T_h (access token) | Decrypt: 2 P + n E | T_IBS^ver + T_H, one T_B^qry per domain |
+| Transformation, per record (stand-in) | symmetric re-wrap (reference only) | Decrypt: 2 P + n E | T_IBS^ver + T_H, one T_B^qry per domain |
+| Verification, per record | n/a | ValidCT: 2 P, plus T_H | T_IBS^ver + T_H, one T_B^qry per domain |
+| Policy update, per affected record | n/a (T_h blacklist) | Encrypt: P + (s+3) E + 2m M | one state update with consensus |
 | Traceability, per event | T_H + one anchoring transaction | T_B^upd + T_con | T_B^upd + T_con |
 
+s = m = n = 10 (the policy size RBPRE-CALX uses) and t = 3. [27]'s
+exponentiations are taken in G1, the cheapest MNT159 group, consistent with the
+constant encryption time of about 3 ms that [27] reports. None of the three
+supports proxy re-encryption or longitudinal retrieval, so the rows marked "stand-in" use the closest operation the scheme has.
+`experiments/rerun_baselines.sh` re-measures the series these definitions changed.
+
 None of the three supports longitudinal retrieval (Table IV). In the
-retrieval experiments, each locates the patient's records by scanning the
-repository index, then runs its own per-record validation.
+retrieval experiments, each locates the patient's records in the hospitals'
+repositories, then runs its own per-record validation. The repositories are
+kept in the same Neo4j server as RBPRE-CALX's retrieval graph
+(`baselines/repository.py`), indexed by patient and hospital. With no
+cross-domain linkage, a compared scheme sends one indexed query per hospital,
+while RBPRE-CALX sends one query over its pseudonymized graph. Both sides
+therefore pay real database round trips (`--repo memory` restores the earlier
+in-memory scan). Both use the same result shape, one row per hospital with one
+list per field, and the same driver (the Neo4j Python driver with Neo4j's Rust
+codec, `neo4j-rust-ext`). At 50k records this takes RBPRE-CALX's candidate query
+from about 2.25 s to 0.17 s and the compared schemes' five lookups from about
+1.6 s to 0.17 s.
+
+**Requester and gateway side (Exp 1).** Every scheme's authorization is split
+into the requester's operations (the doctor's device) and the gateway's or
+verifier's operations, and both are timed:
+
+| | Requester side | Gateway / verifier side |
+|---|---|---|
+| RBPRE-CALX | holder signature, Groth16 proof | challenge, consent attestation, chain state, proof verification, nonce consumption, AuthTok (or ValidState on reuse) |
+| [25] | 2 T_sm + 8 T_h | 1 T_sm + 10 T_h |
+| [27] | ShareDecrypt (1 P) | ShareVerify (2 P + (s+1) E + s M) |
+| [31] | nothing | 2 T_IBS^sign + 2 T_IBS^ver, T_B^qry for an unknown sender |
+
+`e1g_runs.csv` and the figure `e1g_gateway` report the gateway side: the load
+a server carries when many requesters authorize at once, since each requester
+computes its own proof or signature on its own device.
+
+**Storage reads.** In Exps 3, 4 and 6 every scheme reads the ciphertexts it
+transforms or verifies from the same MinIO store, with the same call
+(`EHRStore.get_many`, 16 parallel reads) that RBPRE-CALX's proxy and verifier
+use. RBPRE-CALX's verification (Phase 4) and its proxy (Phase 5) each read
+the records they need, as the protocol has them as separate parties. The
+proxy parses each fetched ciphertext inside its timed step and re-encrypts that
+copy, so deserialization is in the measurement for every scheme.
 
 A fourth scheme, **PRE**, is a conventional CP-ABPRE sharing pipeline over the
 same construction of Ibraimi et al. It scans for the patient's records,
 transforms all of them, and generates a fresh re-encryption key per record.
+It uses the same ciphertexts as RBPRE-CALX, so the single-attribute source
+policy src:H_j/c (one leaf pairing in ReEnc) shortens both equally.
 
 **Filter-equalized variants.** Every retrieval-side baseline method accepts
 `subset`. When it is set, the baseline does its per-record work only on the
@@ -147,7 +210,9 @@ session.
     of the patient's records and filter-equalized.
 - **Exp 3: transformation.**
   - **RBPRE-CALX:** Phase 5 on T_auth, with a re-key cache miss (first use in
-    the session) and a hit (second use).
+    the session) and a hit (second use), timed by wall clock around the whole
+    transformation. The proxy checks each re-key state once and every
+    ciphertext's binding and source policy individually.
   - **Baselines:** transformation of every patient record, and of T_auth only.
 - **Exp 4: verification.**
   - **RBPRE-CALX:** the verification steps of Phase 4 (fetch, record
@@ -195,7 +260,8 @@ re-key states, every run measures four events:
 
 - a policy update (new epoch, pseudonym and consent; invalidation), then the
   hospitals' re-delegation and the first retrieval afterwards, against a
-  steady-state retrieval
+  steady-state retrieval (a repeated request in a live session, measured after
+  one untimed retrieval under the current epoch)
 - consent withdrawal
 - delegation revocation
 - credential revocation

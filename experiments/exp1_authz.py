@@ -8,13 +8,20 @@
       holder-bound proof per request) and Reuse for each --session-sizes value
       (one proof per session of that many requests, ValidState against the
       synchronized state for the others; 0 = one session for all k), and the
-      authentication of [25], [27], [31];
+      authentication of [25], [27], [31]. Every scheme's time is also split
+      into the requester side (the doctor's device: for RBPRE-CALX the holder
+      signature and the proof; for the compared schemes their requester
+      operations of Table IV) and the gateway/verifier side (everything else:
+      for RBPRE-CALX challenge, consent attestation, chain state, proof
+      verification, nonce and AuthTok). The gateway side is the load a server
+      carries when many requesters authorize at once (e1g_runs.csv);
   (c) freshness, replay and holder-binding checks: each attack once per run,
       with the outcome and the time to rejection.
 
     python -m experiments.exp1_authz [--parts abc] [--runs 30] [--offline]
 
-Writes e1a_setup.csv, e1a_runs.csv, e1b_runs.csv, e1b_steps.csv, e1c_checks.csv.
+Writes e1a_setup.csv, e1a_runs.csv, e1b_runs.csv, e1b_steps.csv, e1g_runs.csv,
+e1c_checks.csv.
 """
 
 from __future__ import annotations
@@ -121,12 +128,17 @@ def part_b(s: RBPRESystem, doc, p, ks, runs, session_sizes, ledger) -> None:
     pr = Prims()
     base = [Wang25(pr, ledger), Yan27(pr, ledger, m=s.m), Luo31(pr, ledger)]
     base[2].bind(doc.did)
-    rows, steps = [], []
+    rows, steps, gw = [], [], []
 
     def add(scheme, variant, k, r, ms, t=None, **kw):
         rows.append(dict(scheme=scheme, variant=variant, k=k, run=r, total_ms=ms, **kw))
         if t is not None:
             steps.extend(dict(scheme=scheme, variant=variant, k=k, run=r, step=n_, ms=v) for n_, v in t.ms.items())
+            # requester side = the doctor's device (holder signature and proof); everything else is
+            # gateway, consent-service and chain-state work
+            client = sum(v for n_, v in t.ms.items() if n_.startswith("p3.doc_"))
+            gw.append(dict(scheme=scheme, variant=variant, k=k, run=r, gateway_ms=t.total() - client,
+                           client_ms=client))
 
     # warm-up, not recorded
     s.valid_state(s.authorize(doc, p, "treatment", "cardiology"))
@@ -156,12 +168,18 @@ def part_b(s: RBPRESystem, doc, p, ks, runs, session_sizes, ledger) -> None:
                     ms = (time.perf_counter_ns() - t0) / 1e6
                 add("RBPRE-CALX", f"Reuse {'all' if size == 0 else size}/session", k, r, ms, t, proofs=proofs)
             for b in base:
+                srv = 0
                 with quiet():
                     t0 = time.perf_counter_ns()
                     for _ in range(k):
-                        b.auth_request()
+                        req = b.auth_client()
+                        s0 = time.perf_counter_ns()
+                        b.auth_server(req)
+                        srv += time.perf_counter_ns() - s0
                     ms = (time.perf_counter_ns() - t0) / 1e6
                 add(b.name, "all", k, r, ms)
+                gw.append(dict(scheme=b.name, variant="all", k=k, run=r, gateway_ms=srv / 1e6,
+                               client_ms=ms - srv / 1e6))
             s.pending_anchors.clear()
         last = [x for x in rows if x["k"] == k]
         series = dict.fromkeys((x["scheme"], x["variant"]) for x in last)
@@ -172,6 +190,7 @@ def part_b(s: RBPRESystem, doc, p, ks, runs, session_sizes, ledger) -> None:
         s.pending_anchors.clear()
     write_rows("e1b_runs.csv", rows)
     write_rows("e1b_steps.csv", steps)
+    write_rows("e1g_runs.csv", gw)
 
 
 # ------------------------------------------------------------------ part (c)

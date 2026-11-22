@@ -59,8 +59,7 @@ class World:
 
     def new_target(self) -> Target:
         p = self.s.enroll_patient(f"pat{len(self.targets)}{self.tag}", self.hosp[-1], self.policy)
-        for h in self.hosp:
-            self.s.issue_delegation(p, h, self.doc.domain)
+        self.s.issue_delegations(p, self.hosp, self.doc.domain)
         t = Target(p, H("owner", p.pid))
         self.targets.append(t)
         return t

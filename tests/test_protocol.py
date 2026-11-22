@@ -108,6 +108,29 @@ class TestProtocol(unittest.TestCase):
         got = {r.rid: r.plaintext for r in s.retrieve(sess2)}
         self.assertEqual(got, dict(self.expected, **{new[0]: b"BP 120/80"}))
 
+    def test_4b_delegation_revocation_and_consent_withdrawal(self):
+        s = self.sys
+        s.issue_delegations(self.p, [self.HA, self.HC], self.HB)   # both DRecs in one submission
+        sess = s.authorize(self.doc, self.p, "treatment", "cardiology")
+        self.assertIn(self.rids[3], {r.rid for r in s.retrieve(sess)})
+        e = self.p.e
+        s.revoke_delegation(self.p, self.HC, self.HB)              # DRec revoked + epoch advance together
+        self.assertEqual(self.p.e, e + 1)
+        with self.assertRaises(Rejected):                          # old session is invalidated
+            s.retrieve(sess)
+        s.update_policy(self.p, self.policy)                       # consent for the new epoch
+        s.issue_delegations(self.p, [self.HA], self.HB)            # HC does not delegate again
+        got = {r.rid for r in s.retrieve(s.authorize(self.doc, self.p, "treatment", "cardiology"))}
+        self.assertIn(self.rids[0], got)
+        self.assertNotIn(self.rids[3], got)                        # HC's record needs HC's delegation
+        s.withdraw_consent(self.p)                                 # CRec_C revoked + epoch advance together
+        self.assertEqual(self.p.e, e + 3)
+        with self.assertRaises(Rejected):
+            s.authorize(self.doc, self.p, "treatment", "cardiology")
+        s.update_policy(self.p, self.policy)                       # new consent for the next tests
+        s.issue_delegations(self.p, [self.HA, self.HC], self.HB)
+        self.assertEqual(self.p.e, e + 4)
+
     def test_5_credential_revocation(self):
         s = self.sys
         sess = s.authorize(self.doc, self.p, "treatment", "cardiology")

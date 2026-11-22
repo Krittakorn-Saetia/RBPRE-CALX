@@ -14,6 +14,9 @@ N records of one patient are spread over H hospitals (H in 1, 2, 5, 10, 15,
               or of T_auth (filter-equalized)
   PRE         scan, per-record re-key and re-encryption, binding check
 
+Every scheme reads the ciphertexts it processes from the same MinIO store
+with the same call (store.get_many) that RBPRE-CALX's proxy and verifier use.
+
     python -m experiments.exp6_hospitals [--hospitals 1 2 5 10 15 20] [--n 5000] [--runs 30]
 """
 
@@ -23,6 +26,7 @@ import argparse
 import time
 
 from baselines.common import Prims
+from baselines.repository import DBRepository
 from baselines.schemes import Luo31, PlainPRE, Wang25, Yan27
 from experiments.exp234_retrieval import Series
 from experiments.harness import save_machine, services, write_rows
@@ -76,13 +80,18 @@ def main() -> None:
         pr = Prims()
         base = [Wang25(pr, ledger), Yan27(pr, ledger, m=args.m), Luo31(pr, ledger)]
         base[2].bind(doc.did)
-        pat = [e for e in w.index if e.owner == target.owner]
+        # every scheme reads the ciphertexts it processes from the same MinIO store, with the same call
+        # RBPRE-CALX's proxy and verifier use (store.get_many)
+        uris = {r["rid"]: r["uri"] for r in s.graph.candidates(list(s.cs_pids[target.patient.pid]))}
+        repo = DBRepository()           # the hospitals' repositories: one indexed query per hospital
+        repo.sync(w.index)
         for b in base:
             for variant, subset in (("all", None), ("filtered", auth_set)):
                 def e2e(b=b, subset=subset):
                     for _ in range(h):
                         b.auth_request()                       # cross-domain authentication per hospital
-                    recs = b.retrieve(w.index, target.owner, subset)
+                    recs = b.retrieve(repo, target.owner, subset)
+                    store.get_many([uris[e.rid] for e in recs])
                     b.transform(recs)
                     if hasattr(b, "verify"):
                         b.verify(recs)
@@ -90,15 +99,13 @@ def main() -> None:
                 rows += [dict(scheme=b.name, variant=variant, hospitals=h, n=args.n, run=i, ms=v, runs=len(ys))
                          for i, v in enumerate(ys)]
         pre = PlainPRE(s.scheme, s.kms, pr, ledger)
-        uris = {r["rid"]: r["uri"] for r in s.graph.candidates(list(s.cs_pids[target.patient.pid]))}
-        blobs = dict(zip(target.rids, store.get_many([uris[r] for r in target.rids])))
-        items = [dict(rid=r, hosp=s.cs_open_r[r]["meta"]["hosp"], ct=blobs[r], open=s.cs_open_r[r])
-                 for r in target.rids]
         p_b = f"{rb.id_attr(doc.did)} AND {doc.attrs[0]}"
         for variant, subset in (("all", None), ("filtered", auth_set)):
             def pre_e2e(subset=subset):
-                found = {e.rid for e in pre.retrieve(w.index, target.owner, subset)}
-                sel = [dict(c, ct_k=s.scheme.loads(c["ct"][1])) for c in items if c["rid"] in found]
+                found = [e.rid for e in pre.retrieve(repo, target.owner, subset)]
+                sel = [dict(rid=r, hosp=s.cs_open_r[r]["meta"]["hosp"], ct=blob, open=s.cs_open_r[r],
+                            ct_k=s.scheme.loads(blob[1]))
+                       for r, blob in zip(found, store.get_many([uris[r] for r in found]))]
                 pre.transform(sel, doc.pk_bytes, p_b, sess.chi)
                 pre.verify(sel)
             ys = ser(pre_e2e)
@@ -110,6 +117,8 @@ def main() -> None:
             for k in dict.fromkeys((x["scheme"], x["variant"]) for x in cur)))
         write_rows("e6_runs.csv", rows)
         write_rows("e6_steps.csv", steps)
+        repo.clear()
+        repo.close()
         w.close()
         store.clear()
         graph.close()

@@ -13,7 +13,7 @@ All identifiers are stored as hex strings.
 
 from __future__ import annotations
 
-from neo4j import GraphDatabase
+from neo4j import GraphDatabase, Result
 
 from rbpre import config
 
@@ -46,22 +46,29 @@ class RetrievalGraph:
         self._run("MATCH (p:Patient) WHERE p.pid IN $pids DETACH DELETE p", pids=pids)
 
     def add_records(self, rows: list[dict], batch: int = 5000) -> None:
-        """rows: dicts with rid, pid, phi, ha, uri, hosp (Eq. 45-46)."""
+        """rows: dicts with rid, pid, phi, ha, uri, hosp (Eq. 45-46). The hospital
+        is kept both as the LOCATED_IN relationship and as a record property, so
+        discovery needs no second hop."""
         q = ("UNWIND $rows AS row "
              "MERGE (p:Patient {pid: row.pid}) "
              "MERGE (h:Hospital {hid: row.hosp}) "
-             "CREATE (r:Record {rid: row.rid, phi: row.phi, ha: row.ha, uri: row.uri}) "
+             "CREATE (r:Record {rid: row.rid, phi: row.phi, ha: row.ha, uri: row.uri, hosp: row.hosp}) "
              "CREATE (p)-[:OWNS]->(r) "
              "CREATE (r)-[:LOCATED_IN]->(h)")
         for i in range(0, len(rows), batch):
             self._run(q, rows=rows[i:i + batch])
 
     def candidates(self, pids: list[str]) -> list[dict]:
-        """T_D for the historical pseudonyms P_PID (Eq. 71)."""
-        q = ("MATCH (p:Patient)-[:OWNS]->(r:Record)-[:LOCATED_IN]->(h:Hospital) "
-             "WHERE p.pid IN $pids "
-             "RETURN r.rid AS rid, p.pid AS pid, r.phi AS phi, r.ha AS ha, r.uri AS uri, h.hid AS hosp")
-        return [dict(r) for r in self._run(q, pids=pids)]
+        """T_D for the historical pseudonyms P_PID (Eq. 71): rid, phi, uri, hosp.
+        The server returns one row per hospital holding that hospital's
+        references as one list per field, so the driver decodes a few flat
+        lists rather than one row per record (the same query shape as the
+        compared schemes' repository lookup, baselines/repository.py)."""
+        q = ("MATCH (p:Patient)-[:OWNS]->(r:Record) WHERE p.pid IN $pids "
+             "RETURN r.hosp, collect(r.rid), collect(r.phi), collect(r.uri)")
+        rows = self._drv.execute_query(q, {"pids": pids}, database_="neo4j", result_transformer_=Result.values)
+        return [dict(rid=r, phi=f, uri=u, hosp=hosp) for hosp, rids, phis, uris in rows
+                for r, f, u in zip(rids, phis, uris)]
 
     def rename_patient(self, old_pid: str, new_pid: str) -> int:
         """Re-pseudonymize a patient node after an epoch advance."""

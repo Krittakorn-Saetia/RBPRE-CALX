@@ -104,9 +104,13 @@ class Prims:
         return self.ibs.verify(self.ibs_mpk, pk, msg, sig)
 
 
-def scan(index: list[IndexEntry], owner: bytes, prims: Prims) -> list[IndexEntry]:
-    """Repository scan for schemes without a retrieval index: one owner-tag
-    comparison per stored record."""
+def scan(index, owner: bytes, prims: Prims) -> list[IndexEntry]:
+    """Repository lookup for schemes without a cross-domain retrieval index.
+    With a baselines.repository.DBRepository (what the experiments use) it is one
+    indexed database query per hospital repository; with a plain list it is an
+    in-memory scan with one owner-tag comparison per stored record."""
+    if hasattr(index, "lookup"):
+        return index.lookup(owner)
     want = prims.T_H(b"tag", owner)
     return [e for e in index if hmac.compare_digest(prims.T_H(b"tag", e.owner), want)]
 
